@@ -1018,6 +1018,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         // add topic to metadata topic list if it is not there already and reset expiry
         Cluster cluster = metadata.fetch();
 
+        // Read: 判断给定的topic在当前集群中是不是非法的（如果topic的partition没有leader，则认为该topic是invalid）
         if (cluster.invalidTopics().contains(topic))
             throw new InvalidTopicException(topic);
 

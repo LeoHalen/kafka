@@ -59,21 +59,21 @@ import static org.apache.kafka.common.record.RecordBatch.NO_PARTITION_LEADER_EPO
  */
 public class Metadata implements Closeable {
     private final Logger log;
-    private final long refreshBackoffMs;
-    private final long metadataExpireMs;
-    private int updateVersion;  // bumped on every metadata response
-    private int requestVersion; // bumped on every new topic addition
-    private long lastRefreshMs;
-    private long lastSuccessfulRefreshMs;
-    private KafkaException fatalException;
+    private final long refreshBackoffMs;  // 轮询更新间隔最短时间差（retry.backoff.ms: 默认100ms），防止网络阻塞和增加服务端压力
+    private final long metadataExpireMs;  // 每隔多久更新一次（metadata.max.age.ms: 默认300*1000ms）
+    private int updateVersion;  // 更新版本号，每更新成功1次，version自增1,主要是用于判断metadata是否更新
+    private int requestVersion; // 请求版本号，每发送一次请求，version自增1
+    private long lastRefreshMs; // 最近一次更新元数据的时间戳（包括更新失败的情况）
+    private long lastSuccessfulRefreshMs;  // 最近一次成功更新元数据的时间戳
+    private KafkaException fatalException; // 更新元数据失败的异常信息
     private Set<String> invalidTopics;
     private Set<String> unauthorizedTopics;
-    private MetadataCache cache = MetadataCache.empty();
-    private boolean needFullUpdate;
-    private boolean needPartialUpdate;
-    private final ClusterResourceListeners clusterResourceListeners;
+    private MetadataCache cache = MetadataCache.empty();  // Kafka集群的元数据信息缓存
+    private boolean needFullUpdate;    // 标识全部更新
+    private boolean needPartialUpdate; // 标识部分更新
+    private final ClusterResourceListeners clusterResourceListeners;  // 集群元数据更新监听器列表
     private boolean isClosed;
-    private final Map<TopicPartition, Integer> lastSeenLeaderEpochs;
+    private final Map<TopicPartition, Integer> lastSeenLeaderEpochs;  // 存储Partition最近一次的leaderEpoch
 
     /**
      * Create a new Metadata instance
