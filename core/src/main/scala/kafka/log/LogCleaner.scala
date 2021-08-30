@@ -21,7 +21,6 @@ import java.io.{File, IOException}
 import java.nio._
 import java.util.Date
 import java.util.concurrent.TimeUnit
-
 import kafka.common._
 import kafka.metrics.KafkaMetricsGroup
 import kafka.server.{BrokerReconfigurable, KafkaConfig, LogDirFailureChannel}
@@ -32,7 +31,7 @@ import org.apache.kafka.common.errors.{CorruptRecordException, KafkaStorageExcep
 import org.apache.kafka.common.record.MemoryRecords.RecordFilter
 import org.apache.kafka.common.record.MemoryRecords.RecordFilter.BatchRetention
 import org.apache.kafka.common.record._
-import org.apache.kafka.common.utils.Time
+import org.apache.kafka.common.utils.{BufferSupplier, Time}
 
 import scala.jdk.CollectionConverters._
 import scala.collection.mutable.ListBuffer
@@ -91,7 +90,7 @@ import scala.util.control.ControlThrowable
  */
 class LogCleaner(initialConfig: CleanerConfig,
                  val logDirs: Seq[File],
-                 val logs: Pool[TopicPartition, Log],
+                 val logs: Pool[TopicPartition, UnifiedLog],
                  val logDirFailureChannel: LogDirFailureChannel,
                  time: Time = Time.SYSTEM) extends Logging with KafkaMetricsGroup with BrokerReconfigurable
 {
@@ -273,7 +272,7 @@ class LogCleaner(initialConfig: CleanerConfig,
     * retention threads need to make this call to obtain:
     * @return A list of log partitions that retention threads can safely work on
     */
-  def pauseCleaningForNonCompactedPartitions(): Iterable[(TopicPartition, Log)] = {
+  def pauseCleaningForNonCompactedPartitions(): Iterable[(TopicPartition, UnifiedLog)] = {
     cleanerManager.pauseCleaningForNonCompactedPartitions()
   }
 
@@ -357,7 +356,7 @@ class LogCleaner(initialConfig: CleanerConfig,
             case e: Exception => throw new LogCleaningException(cleanable.log, e.getMessage, e)
           }
       }
-      val deletable: Iterable[(TopicPartition, Log)] = cleanerManager.deletableLogs()
+      val deletable: Iterable[(TopicPartition, UnifiedLog)] = cleanerManager.deletableLogs()
       try {
         deletable.foreach { case (_, log) =>
           try {
@@ -450,13 +449,6 @@ object LogCleaner {
       enableCleaner = config.logCleanerEnable)
 
   }
-
-  def createNewCleanedSegment(log: Log, baseOffset: Long): LogSegment = {
-    LogSegment.deleteIfExists(log.dir, baseOffset, fileSuffix = Log.CleanedFileSuffix)
-    LogSegment.open(log.dir, baseOffset, log.config, Time.SYSTEM,
-      fileSuffix = Log.CleanedFileSuffix, initFileSize = log.initFileSize, preallocate = log.config.preallocate)
-  }
-
 }
 
 /**
@@ -557,14 +549,14 @@ private[log] class Cleaner(val id: Int,
    * @param transactionMetadata State of ongoing transactions which is carried between the cleaning
    *                            of the grouped segments
    */
-  private[log] def cleanSegments(log: Log,
+  private[log] def cleanSegments(log: UnifiedLog,
                                  segments: Seq[LogSegment],
                                  map: OffsetMap,
                                  deleteHorizonMs: Long,
                                  stats: CleanerStats,
                                  transactionMetadata: CleanedTransactionMetadata): Unit = {
     // create a new segment with a suffix appended to the name of the log and indexes
-    val cleaned = LogCleaner.createNewCleanedSegment(log, segments.head.baseOffset)
+    val cleaned = UnifiedLog.createNewCleanedSegment(log.dir, log.config, segments.head.baseOffset)
     transactionMetadata.cleanedIndex = Some(cleaned.txnIndex)
 
     try {
@@ -839,7 +831,10 @@ private[log] class Cleaner(val id: Int,
             logSize + segs.head.size <= maxSize &&
             indexSize + segs.head.offsetIndex.sizeInBytes <= maxIndexSize &&
             timeIndexSize + segs.head.timeIndex.sizeInBytes <= maxIndexSize &&
-            lastOffsetForFirstSegment(segs, firstUncleanableOffset) - group.last.baseOffset <= Int.MaxValue) {
+            //if first segment size is 0, we don't need to do the index offset range check.
+            //this will avoid empty log left every 2^31 message.
+            (segs.head.size == 0 ||
+              lastOffsetForFirstSegment(segs, firstUncleanableOffset) - group.last.baseOffset <= Int.MaxValue)) {
         group = segs.head :: group
         logSize += segs.head.size
         indexSize += segs.head.offsetIndex.sizeInBytes
@@ -881,7 +876,7 @@ private[log] class Cleaner(val id: Int,
    * @param map The map in which to store the mappings
    * @param stats Collector for cleaning statistics
    */
-  private[log] def buildOffsetMap(log: Log,
+  private[log] def buildOffsetMap(log: UnifiedLog,
                                   start: Long,
                                   end: Long,
                                   map: OffsetMap,
@@ -1068,7 +1063,7 @@ private class CleanerStats(time: Time = Time.SYSTEM) {
   * and whether it needs compaction immediately.
   */
 private case class LogToClean(topicPartition: TopicPartition,
-                              log: Log,
+                              log: UnifiedLog,
                               firstDirtyOffset: Long,
                               uncleanableOffset: Long,
                               needCompactionNow: Boolean = false) extends Ordered[LogToClean] {

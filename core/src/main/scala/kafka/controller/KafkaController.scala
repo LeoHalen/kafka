@@ -18,13 +18,13 @@ package kafka.controller
 
 import java.util
 import java.util.concurrent.TimeUnit
-
 import kafka.admin.AdminOperationException
 import kafka.api._
 import kafka.common._
 import kafka.controller.KafkaController.AlterIsrCallback
 import kafka.cluster.Broker
 import kafka.controller.KafkaController.{AlterReassignmentsCallback, ElectLeadersCallback, ListReassignmentsCallback, UpdateFeaturesCallback}
+import kafka.coordinator.transaction.ZkProducerIdManager
 import kafka.metrics.{KafkaMetricsGroup, KafkaTimer}
 import kafka.server._
 import kafka.utils._
@@ -37,20 +37,20 @@ import org.apache.kafka.common.ElectionType
 import org.apache.kafka.common.KafkaException
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.errors.{BrokerNotAvailableException, ControllerMovedException, StaleBrokerEpochException}
-import org.apache.kafka.common.message.{AlterIsrRequestData, AlterIsrResponseData}
+import org.apache.kafka.common.message.{AllocateProducerIdsRequestData, AllocateProducerIdsResponseData, AlterIsrRequestData, AlterIsrResponseData, UpdateFeaturesRequestData}
 import org.apache.kafka.common.feature.{Features, FinalizedVersionRange}
-import org.apache.kafka.common.message.UpdateFeaturesRequestData
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.requests.{AbstractControlRequest, ApiError, LeaderAndIsrResponse, UpdateFeaturesRequest, UpdateMetadataResponse}
 import org.apache.kafka.common.utils.{Time, Utils}
+import org.apache.kafka.server.common.ProducerIdsBlock
 import org.apache.zookeeper.KeeperException
 import org.apache.zookeeper.KeeperException.Code
 
 import scala.collection.{Map, Seq, Set, immutable, mutable}
 import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
-import scala.util.{Failure, Try}
+import scala.util.{Failure, Success, Try}
 
 sealed trait ElectionTrigger
 final case object AutoTriggered extends ElectionTrigger
@@ -1033,7 +1033,7 @@ class KafkaController(val config: KafkaConfig,
       (topicPartition -> assignment)
 
     val setDataResponse = zkClient.setTopicAssignmentRaw(topicPartition.topic,
-      controllerContext.topicIds(topicPartition.topic),
+      controllerContext.topicIds.get(topicPartition.topic),
       topicAssignment, controllerContext.epochZkVersion)
     setDataResponse.resultCode match {
       case Code.OK =>
@@ -1220,7 +1220,7 @@ class KafkaController(val config: KafkaConfig,
               val leaderIsrAndControllerEpoch = LeaderIsrAndControllerEpoch(leaderAndIsr, epoch)
               controllerContext.putPartitionLeadershipInfo(partition, leaderIsrAndControllerEpoch)
               finalLeaderIsrAndControllerEpoch = Some(leaderIsrAndControllerEpoch)
-              info(s"Updated leader epoch for partition $partition to ${leaderAndIsr.leaderEpoch}")
+              info(s"Updated leader epoch for partition $partition to ${leaderAndIsr.leaderEpoch}, zkVersion=${leaderAndIsr.zkVersion}")
               true
             case Some(Left(e)) => throw e
             case None => false
@@ -1658,9 +1658,23 @@ class KafkaController(val config: KafkaConfig,
   }
 
   private def processTopicIds(topicIdAssignments: Set[TopicIdReplicaAssignment]): Unit = {
-    val updated = zkClient.setTopicIds(topicIdAssignments.filter(_.topicId.isEmpty), controllerContext.epochZkVersion)
-    val allTopicIdAssignments = updated ++ topicIdAssignments.filter(_.topicId.isDefined)
-    allTopicIdAssignments.foreach(topicIdAssignment => controllerContext.addTopicId(topicIdAssignment.topic, topicIdAssignment.topicId.get))
+    // Create topic IDs for topics missing them if we are using topic IDs
+    // Otherwise, maintain what we have in the topicZNode
+    val updatedTopicIdAssignments = if (config.usesTopicId) {
+      val (withTopicIds, withoutTopicIds) = topicIdAssignments.partition(_.topicId.isDefined)
+      withTopicIds ++ zkClient.setTopicIds(withoutTopicIds, controllerContext.epochZkVersion)
+    } else {
+      topicIdAssignments
+    }
+
+    // Add topic IDs to controller context
+    // If we don't have IBP 2.8, but are running 2.8 code, put any topic IDs from the ZNode in controller context
+    // This is to avoid losing topic IDs during operations like partition reassignments while the cluster is in a mixed state
+    updatedTopicIdAssignments.foreach { topicIdAssignment =>
+      topicIdAssignment.topicId.foreach { topicId =>
+        controllerContext.addTopicId(topicIdAssignment.topic, topicId)
+    }
+    }
   }
 
   private def processLogDirEventNotification(): Unit = {
@@ -1690,7 +1704,7 @@ class KafkaController(val config: KafkaConfig,
       }.toMap
 
       zkClient.setTopicAssignment(topic,
-        controllerContext.topicIds(topic),
+        controllerContext.topicIds.get(topic),
         existingPartitionReplicaAssignment,
         controllerContext.epochZkVersion)
     }
@@ -2288,7 +2302,7 @@ class KafkaController(val config: KafkaConfig,
     }
 
     if (!brokerEpochOpt.contains(brokerEpoch)) {
-      info(s"Ignoring AlterIsr due to stale broker epoch $brokerEpoch for broker $brokerId")
+      info(s"Ignoring AlterIsr due to stale broker epoch $brokerEpoch and local broker epoch $brokerEpochOpt for broker $brokerId")
       callback.apply(Right(Errors.STALE_BROKER_EPOCH))
       return
     }
@@ -2330,17 +2344,17 @@ class KafkaController(val config: KafkaConfig,
               debug(s"ISR for partition $partition updated to [${updatedIsr.isr.mkString(",")}] and zkVersion updated to [${updatedIsr.zkVersion}]")
               partitionResponses(partition) = Right(updatedIsr)
               Some(partition -> updatedIsr)
-            case Left(error) =>
-              warn(s"Failed to update ISR for partition $partition", error)
-              partitionResponses(partition) = Left(Errors.forException(error))
+            case Left(e) =>
+              error(s"Failed to update ISR for partition $partition", e)
+              partitionResponses(partition) = Left(Errors.forException(e))
               None
           }
       }
 
-      badVersionUpdates.foreach(partition => {
-        debug(s"Failed to update ISR for partition $partition, bad ZK version")
+      badVersionUpdates.foreach { partition =>
+        info(s"Failed to update ISR to ${adjustedIsrs(partition)} for partition $partition, bad ZK version.")
         partitionResponses(partition) = Left(Errors.INVALID_UPDATE_VERSION)
-      })
+      }
 
       def processUpdateNotifications(partitions: Seq[TopicPartition]): Unit = {
         val liveBrokers: Seq[Int] = controllerContext.liveOrShuttingDownBrokerIds.toSeq
@@ -2371,6 +2385,54 @@ class KafkaController(val config: KafkaConfig,
           }
         }
       }
+    }
+  }
+
+  def allocateProducerIds(allocateProducerIdsRequest: AllocateProducerIdsRequestData,
+                          callback: AllocateProducerIdsResponseData => Unit): Unit = {
+
+    def eventManagerCallback(results: Either[Errors, ProducerIdsBlock]): Unit = {
+      results match {
+        case Left(error) => callback.apply(new AllocateProducerIdsResponseData().setErrorCode(error.code))
+        case Right(pidBlock) => callback.apply(
+          new AllocateProducerIdsResponseData()
+            .setProducerIdStart(pidBlock.producerIdStart())
+            .setProducerIdLen(pidBlock.producerIdLen()))
+      }
+    }
+    eventManager.put(AllocateProducerIds(allocateProducerIdsRequest.brokerId,
+      allocateProducerIdsRequest.brokerEpoch, eventManagerCallback))
+  }
+
+  def processAllocateProducerIds(brokerId: Int, brokerEpoch: Long, callback: Either[Errors, ProducerIdsBlock] => Unit): Unit = {
+    // Handle a few short-circuits
+    if (!isActive) {
+      callback.apply(Left(Errors.NOT_CONTROLLER))
+      return
+    }
+
+    val brokerEpochOpt = controllerContext.liveBrokerIdAndEpochs.get(brokerId)
+    if (brokerEpochOpt.isEmpty) {
+      warn(s"Ignoring AllocateProducerIds due to unknown broker $brokerId")
+      callback.apply(Left(Errors.BROKER_ID_NOT_REGISTERED))
+      return
+    }
+
+    if (!brokerEpochOpt.contains(brokerEpoch)) {
+      warn(s"Ignoring AllocateProducerIds due to stale broker epoch $brokerEpoch for broker $brokerId")
+      callback.apply(Left(Errors.STALE_BROKER_EPOCH))
+      return
+    }
+
+    val maybeNewProducerIdsBlock = try {
+      Try(ZkProducerIdManager.getNewProducerIdBlock(brokerId, zkClient, this))
+    } catch {
+      case ke: KafkaException => Failure(ke)
+    }
+
+    maybeNewProducerIdsBlock match {
+      case Failure(exception) => callback.apply(Left(Errors.forException(exception)))
+      case Success(newProducerIdBlock) => callback.apply(Right(newProducerIdBlock))
     }
   }
 
@@ -2452,6 +2514,8 @@ class KafkaController(val config: KafkaConfig,
           processIsrChangeNotification()
         case AlterIsrReceived(brokerId, brokerEpoch, isrsToAlter, callback) =>
           processAlterIsr(brokerId, brokerEpoch, isrsToAlter, callback)
+        case AllocateProducerIds(brokerId, brokerEpoch, callback) =>
+          processAllocateProducerIds(brokerId, brokerEpoch, callback)
         case Startup =>
           processStartup()
       }
@@ -2569,6 +2633,7 @@ case class LeaderIsrAndControllerEpoch(leaderAndIsr: LeaderAndIsr, controllerEpo
     leaderAndIsrInfo.append("(Leader:" + leaderAndIsr.leader)
     leaderAndIsrInfo.append(",ISR:" + leaderAndIsr.isr.mkString(","))
     leaderAndIsrInfo.append(",LeaderEpoch:" + leaderAndIsr.leaderEpoch)
+    leaderAndIsrInfo.append(",ZkVersion:" + leaderAndIsr.zkVersion)
     leaderAndIsrInfo.append(",ControllerEpoch:" + controllerEpoch + ")")
     leaderAndIsrInfo.toString()
   }
@@ -2742,6 +2807,12 @@ case class ListPartitionReassignments(partitionsOpt: Option[Set[TopicPartition]]
 case class UpdateFeatures(request: UpdateFeaturesRequest,
                           callback: UpdateFeaturesCallback) extends ControllerEvent {
   override def state: ControllerState = ControllerState.UpdateFeatures
+  override def preempt(): Unit = {}
+}
+
+case class AllocateProducerIds(brokerId: Int, brokerEpoch: Long, callback: Either[Errors, ProducerIdsBlock] => Unit)
+    extends ControllerEvent {
+  override def state: ControllerState = ControllerState.Idle
   override def preempt(): Unit = {}
 }
 

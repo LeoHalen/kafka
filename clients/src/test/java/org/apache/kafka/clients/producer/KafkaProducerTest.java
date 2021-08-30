@@ -68,12 +68,12 @@ import org.apache.kafka.test.MockPartitioner;
 import org.apache.kafka.test.MockProducerInterceptor;
 import org.apache.kafka.test.MockSerializer;
 import org.apache.kafka.test.TestUtils;
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 import java.lang.management.ManagementFactory;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -98,14 +98,15 @@ import java.util.stream.Stream;
 
 import static java.util.Collections.emptyMap;
 import static java.util.Collections.singletonMap;
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertThrows;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -172,6 +173,89 @@ public class KafkaProducerTest {
     }
 
     @Test
+    public void testAcksAndIdempotenceForIdempotentProducers() {
+        Properties baseProps = new Properties() {{
+                setProperty(
+                    ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9999");
+                setProperty(
+                    ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+                setProperty(
+                    ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+            }};
+
+        Properties validProps = new Properties() {{
+                putAll(baseProps);
+                setProperty(ProducerConfig.ACKS_CONFIG, "0");
+                setProperty(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "false");
+            }};
+        ProducerConfig config = new ProducerConfig(validProps);
+        assertFalse(
+            config.getBoolean(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG),
+            "idempotence should be overwritten");
+        assertEquals(
+            "0",
+            config.getString(ProducerConfig.ACKS_CONFIG),
+            "acks should be overwritten");
+
+        Properties validProps2 = new Properties() {{
+                putAll(baseProps);
+                setProperty(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "transactionalId");
+            }};
+        config = new ProducerConfig(validProps2);
+        assertTrue(
+            config.getBoolean(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG),
+            "idempotence should be set with the default value");
+        assertEquals(
+            "-1",
+            config.getString(ProducerConfig.ACKS_CONFIG),
+            "acks should be set with the default value");
+
+        Properties validProps3 = new Properties() {{
+                putAll(baseProps);
+                setProperty(ProducerConfig.ACKS_CONFIG, "all");
+                setProperty(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "false");
+            }};
+        config = new ProducerConfig(validProps3);
+        assertFalse(config.getBoolean(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG),
+            "idempotence should be overwritten");
+        assertEquals(
+            "-1",
+            config.getString(ProducerConfig.ACKS_CONFIG),
+            "acks should be overwritten");
+
+        Properties invalidProps = new Properties() {{
+                putAll(baseProps);
+                setProperty(ProducerConfig.ACKS_CONFIG, "0");
+                setProperty(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "false");
+                setProperty(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "transactionalId");
+            }};
+        assertThrows(
+            ConfigException.class,
+            () -> new ProducerConfig(invalidProps),
+            "Cannot set a transactional.id without also enabling idempotence");
+
+        Properties invalidProps2 = new Properties() {{
+                putAll(baseProps);
+                setProperty(ProducerConfig.ACKS_CONFIG, "1");
+                setProperty(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
+            }};
+        assertThrows(
+            ConfigException.class,
+            () -> new ProducerConfig(invalidProps2),
+            "Must set acks to all in order to use the idempotent producer");
+
+        Properties invalidProps3 = new Properties() {{
+                putAll(baseProps);
+                setProperty(ProducerConfig.ACKS_CONFIG, "0");
+                setProperty(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
+            }};
+        assertThrows(
+            ConfigException.class,
+            () -> new ProducerConfig(invalidProps3),
+            "Must set acks to all in order to use the idempotent producer");
+    }
+
+    @Test
     public void testMetricsReporterAutoGeneratedClientId() {
         Properties props = new Properties();
         props.setProperty(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9999");
@@ -181,7 +265,7 @@ public class KafkaProducerTest {
 
         MockMetricsReporter mockMetricsReporter = (MockMetricsReporter) producer.metrics.reporters().get(0);
 
-        Assert.assertEquals(producer.getClientId(), mockMetricsReporter.clientId);
+        assertEquals(producer.getClientId(), mockMetricsReporter.clientId);
         producer.close();
     }
 
@@ -225,7 +309,7 @@ public class KafkaProducerTest {
         try (KafkaProducer<?, ?> ff = new KafkaProducer<>(props, new StringSerializer(), new StringSerializer())) {
             fail("Constructor should throw exception");
         } catch (ConfigException e) {
-            assertTrue("Unexpected exception message: " + e.getMessage(), e.getMessage().contains("not string key"));
+            assertTrue(e.getMessage().contains("not string key"), "Unexpected exception message: " + e.getMessage());
         }
     }
 
@@ -264,7 +348,7 @@ public class KafkaProducerTest {
             assertEquals(0, MockProducerInterceptor.CLOSE_COUNT.get());
 
             // Cluster metadata will only be updated on calling onSend.
-            Assert.assertNull(MockProducerInterceptor.CLUSTER_META.get());
+            assertNull(MockProducerInterceptor.CLUSTER_META.get());
 
             producer.close();
             assertEquals(1, MockProducerInterceptor.INIT_COUNT.get());
@@ -335,13 +419,12 @@ public class KafkaProducerTest {
             // Ensure send has started
             client.waitForRequests(1, 1000);
 
-            assertTrue("Close terminated prematurely", future.cancel(true));
+            assertTrue(future.cancel(true), "Close terminated prematurely");
 
             TestUtils.waitForCondition(() -> closeException.get() != null,
                     "InterruptException did not occur within timeout.");
 
-            assertTrue("Expected exception not thrown " + closeException,
-                    closeException.get() instanceof InterruptException);
+            assertTrue(closeException.get() instanceof InterruptException, "Expected exception not thrown " + closeException);
         } finally {
             executor.shutdownNow();
         }
@@ -641,13 +724,6 @@ public class KafkaProducerTest {
 
     @SuppressWarnings("unchecked")
     @Test
-    @Deprecated
-    public void testHeadersWithExtendedClasses() {
-        doTestHeaders(org.apache.kafka.common.serialization.ExtendedSerializer.class);
-    }
-
-    @SuppressWarnings("unchecked")
-    @Test
     public void testHeaders() {
         doTestHeaders(Serializer.class);
     }
@@ -808,14 +884,14 @@ public class KafkaProducerTest {
             client.prepareResponse(
                 request -> request instanceof FindCoordinatorRequest &&
                     ((FindCoordinatorRequest) request).data().keyType() == FindCoordinatorRequest.CoordinatorType.TRANSACTION.id(),
-                FindCoordinatorResponse.prepareResponse(Errors.NONE, host1));
+                FindCoordinatorResponse.prepareResponse(Errors.NONE, "bad-transaction", host1));
 
             assertThrows(TimeoutException.class, producer::initTransactions);
 
             client.prepareResponse(
                 request -> request instanceof FindCoordinatorRequest &&
                                ((FindCoordinatorRequest) request).data().keyType() == FindCoordinatorRequest.CoordinatorType.TRANSACTION.id(),
-                FindCoordinatorResponse.prepareResponse(Errors.NONE, host1));
+                FindCoordinatorResponse.prepareResponse(Errors.NONE, "bad-transaction", host1));
 
             client.prepareResponse(initProducerIdResponse(1L, (short) 5, Errors.NONE));
 
@@ -841,7 +917,7 @@ public class KafkaProducerTest {
         Node node = metadata.fetch().nodes().get(0);
         client.throttle(node, 5000);
 
-        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, host1));
+        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, "some.id", host1));
         client.prepareResponse(initProducerIdResponse(1L, (short) 5, Errors.NONE));
 
         try (Producer<String, String> producer = kafkaProducer(configs, new StringSerializer(),
@@ -863,7 +939,7 @@ public class KafkaProducerTest {
         MockClient client = new MockClient(time, metadata);
         client.updateMetadata(initialUpdateResponse);
 
-        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, host1));
+        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, "some.id", host1));
         client.prepareResponse(initProducerIdResponse(1L, (short) 5, Errors.NONE));
         client.prepareResponse(endTxnResponse(Errors.NONE));
 
@@ -892,10 +968,10 @@ public class KafkaProducerTest {
         Node node = metadata.fetch().nodes().get(0);
         client.throttle(node, 5000);
 
-        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, host1));
+        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, "some.id", host1));
         client.prepareResponse(initProducerIdResponse(1L, (short) 5, Errors.NONE));
         client.prepareResponse(addOffsetsToTxnResponse(Errors.NONE));
-        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, host1));
+        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, "some.id", host1));
         String groupId = "group";
         client.prepareResponse(request ->
             ((TxnOffsetCommitRequest) request).data().groupId().equals(groupId),
@@ -907,27 +983,18 @@ public class KafkaProducerTest {
             new StringSerializer(), metadata, client, null, time)) {
             producer.initTransactions();
             producer.beginTransaction();
-            producer.sendOffsetsToTransaction(Collections.emptyMap(), groupId);
+            producer.sendOffsetsToTransaction(Collections.emptyMap(), new ConsumerGroupMetadata(groupId));
             producer.commitTransaction();
         }
     }
 
     @Test
     public void testSendTxnOffsetsWithGroupMetadata() {
-        sendOffsetsWithGroupMetadata((short) 3);
-    }
-
-    @Test
-    public void testSendTxnOffsetsWithGroupMetadataDowngrade() {
-        sendOffsetsWithGroupMetadata((short) 2);
-    }
-
-    private void sendOffsetsWithGroupMetadata(final short maxVersion) {
+        final short maxVersion = (short) 3;
         Map<String, Object> configs = new HashMap<>();
         configs.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "some.id");
         configs.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 10000);
         configs.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9000");
-        configs.put(ProducerConfig.AUTO_DOWNGRADE_TXN_COMMIT, true);
 
         Time time = new MockTime(1);
         MetadataResponse initialUpdateResponse = RequestTestUtils.metadataUpdateWith(1, singletonMap("topic", 1));
@@ -940,33 +1007,26 @@ public class KafkaProducerTest {
         Node node = metadata.fetch().nodes().get(0);
         client.throttle(node, 5000);
 
-        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, host1));
+        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, "some.id", host1));
         client.prepareResponse(initProducerIdResponse(1L, (short) 5, Errors.NONE));
         client.prepareResponse(addOffsetsToTxnResponse(Errors.NONE));
-        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, host1));
+        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, "some.id", host1));
         String groupId = "group";
         String memberId = "member";
         int generationId = 5;
         String groupInstanceId = "instance";
         client.prepareResponse(request -> {
             TxnOffsetCommitRequestData data = ((TxnOffsetCommitRequest) request).data();
-            if (maxVersion < 3) {
-                return data.groupId().equals(groupId) &&
-                           data.memberId().equals(JoinGroupRequest.UNKNOWN_MEMBER_ID) &&
-                           data.generationId() == JoinGroupRequest.UNKNOWN_GENERATION_ID &&
-                           data.groupInstanceId() == null;
-            } else {
-                return data.groupId().equals(groupId) &&
-                           data.memberId().equals(memberId) &&
-                           data.generationId() == generationId &&
-                           data.groupInstanceId().equals(groupInstanceId);
-            }
+            return data.groupId().equals(groupId) &&
+                data.memberId().equals(memberId) &&
+                data.generationId() == generationId &&
+                data.groupInstanceId().equals(groupInstanceId);
         }, txnOffsetsCommitResponse(Collections.singletonMap(
             new TopicPartition("topic", 0), Errors.NONE)));
         client.prepareResponse(endTxnResponse(Errors.NONE));
 
         try (Producer<String, String> producer = kafkaProducer(configs, new StringSerializer(),
-            new StringSerializer(), metadata, client, null, time)) {
+                                                               new StringSerializer(), metadata, client, null, time)) {
             producer.initTransactions();
             producer.beginTransaction();
             ConsumerGroupMetadata groupMetadata = new ConsumerGroupMetadata(groupId,
@@ -1003,7 +1063,7 @@ public class KafkaProducerTest {
         Node node = metadata.fetch().nodes().get(0);
         client.throttle(node, 5000);
 
-        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, host1));
+        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, "some.id", host1));
         client.prepareResponse(initProducerIdResponse(1L, (short) 5, Errors.NONE));
 
         try (Producer<String, String> producer = kafkaProducer(configs, new StringSerializer(),
@@ -1096,8 +1156,8 @@ public class KafkaProducerTest {
 
         Future<RecordMetadata> future = producer.send(record);
 
-        assertEquals("Cluster has incorrect invalid topic list.", Collections.singleton(invalidTopicName),
-                metadata.fetch().invalidTopics());
+        assertEquals(Collections.singleton(invalidTopicName),
+                metadata.fetch().invalidTopics(), "Cluster has incorrect invalid topic list.");
         TestUtils.assertFutureError(future, InvalidTopicException.class);
 
         producer.close(Duration.ofMillis(0));
@@ -1214,7 +1274,7 @@ public class KafkaProducerTest {
 
         ExecutorService executorService = Executors.newSingleThreadExecutor();
         CountDownLatch assertionDoneLatch = new CountDownLatch(1);
-        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, host1));
+        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, "this-is-a-transactional-id", host1));
         executorService.submit(() -> {
             assertThrows(KafkaException.class, producer::initTransactions);
             assertionDoneLatch.countDown();
@@ -1243,7 +1303,7 @@ public class KafkaProducerTest {
 
         ExecutorService executorService = Executors.newSingleThreadExecutor();
         CountDownLatch assertionDoneLatch = new CountDownLatch(1);
-        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, host1));
+        client.prepareResponse(FindCoordinatorResponse.prepareResponse(Errors.NONE, "this-is-a-transactional-id", host1));
         executorService.submit(() -> {
             assertThrows(KafkaException.class, producer::initTransactions);
             assertionDoneLatch.countDown();
@@ -1267,7 +1327,7 @@ public class KafkaProducerTest {
         MetricName testMetricName = producer.metrics.metricName("test-metric",
                 "grp1", "test metric");
         producer.metrics.addMetric(testMetricName, new Avg());
-        Assert.assertNotNull(server.getObjectInstance(new ObjectName("kafka.producer:type=grp1,client-id=client-1")));
+        assertNotNull(server.getObjectInstance(new ObjectName("kafka.producer:type=grp1,client-id=client-1")));
         producer.close();
     }
 
@@ -1307,6 +1367,13 @@ public class KafkaProducerTest {
                 null, null, null, Time.SYSTEM)) {
             assertTrue(config.unused().contains(SslConfigs.SSL_PROTOCOL_CONFIG));
         }
+    }
+
+    @Test
+    public void testNullTopicName() {
+        // send a record with null topic should fail
+        assertThrows(IllegalArgumentException.class, () -> new ProducerRecord<>(null, 1,
+            "key".getBytes(StandardCharsets.UTF_8), "value".getBytes(StandardCharsets.UTF_8)));
     }
 
     private static final List<String> CLIENT_IDS = new ArrayList<>();
