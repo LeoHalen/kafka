@@ -37,15 +37,24 @@ public final class Cluster {
     private final boolean isBootstrapConfigured;
     // 集群中节点信息列表
     private final List<Node> nodes;
-    private final Set<String> unauthorizedTopics;  // 未认证的topics
-    private final Set<String> invalidTopics;  // 失效的topics
-    private final Set<String> internalTopics; // Kafka内置的topics
+    // // 未认证的topics
+    private final Set<String> unauthorizedTopics;
+    // 失效的topics
+    private final Set<String> invalidTopics;
+    // Kafka内置的topics
+    private final Set<String> internalTopics;
     private final Node controller;
-    private final Map<TopicPartition, PartitionInfo> partitionsByTopicPartition; // Topic分片与分片详细信息的对应关系
-    private final Map<String, List<PartitionInfo>> partitionsByTopic; // Topic名称和分片详细信息的对应关系（可能无Leader副本的partition）
-    private final Map<String, List<PartitionInfo>> availablePartitionsByTopic; // Topic名称和有Leader副本的分片详细信息的对应关系
-    private final Map<Integer, List<PartitionInfo>> partitionsByNode; // Node节点ID和分片详细信息的对应关系
-    private final Map<Integer, Node> nodesById; // BrokerId 与Node节点之间的对应关系，方便按照BrokerId进行索引
+    // Topic分片与分片详细信息的对应关系
+    private final Map<TopicPartition, PartitionInfo> partitionsByTopicPartition;
+    // Topic名称和分片详细信息的对应关系
+    private final Map<String, List<PartitionInfo>> partitionsByTopic;
+    // Topic名称和分片详细信息映射关系，这里的List<PartitionInfo>中存放的分区必须是有Leader副本的Partition，↙
+    // ↗ 而partitionsByTopic中记录的分区则不一定有Leader副本，因为某些中间状态，例如Leader副本宕机而触发的选举过程中，分区不一定有Leader副本。
+    private final Map<String, List<PartitionInfo>> availablePartitionsByTopic;
+    // Node和PartitionInfo的映射关系，可以按节点id获得其上分布的全部分区的详细信息
+    private final Map<Integer, List<PartitionInfo>> partitionsByNode;
+    // BrokerId 与Node节点之间的对应关系，方便按照BrokerId进行索引
+    private final Map<Integer, Node> nodesById;
     private final ClusterResource clusterResource;
     private final Map<String, Uuid> topicIds;
     private final Map<Uuid, String> topicNames;
