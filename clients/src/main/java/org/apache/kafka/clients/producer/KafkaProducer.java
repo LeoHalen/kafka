@@ -238,23 +238,37 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
     public static final String NETWORK_THREAD_PREFIX = "kafka-producer-network-thread";
     public static final String PRODUCER_METRIC_GROUP_NAME = "producer-metrics";
 
+    // 生产者唯一标识
     private final String clientId;
     // Visible for testing
     final Metrics metrics;
+    // 分区选择器，根据一定的策略，将消息路由到合适的分区
     private final Partitioner partitioner;
+    // 消息最大长度，这个长度包含消息头、序列化后的key和序列化后的value的长度
     private final int maxRequestSize;
+    // 发送单个消息的缓冲区大小
     private final long totalMemorySize;
+    // 整个Kafka集群的元数据（历史版本此变量类是Metadata）
     private final ProducerMetadata metadata;
+    // 用于收集并缓存消息，等待Sender线程发送
     private final RecordAccumulator accumulator;
+    // 发送消息的Sender任务，实现了Runnable接口，在ioThread线程中执行
     private final Sender sender;
+    // 执行Sender任务发送消息的线程，称为“Sender线程”
     private final Thread ioThread;
+    // 压缩算法，可选项有none、gzip、snappy、lz4。这是针对RecordAccumulator中多条消息进行的压缩，所以消息越多，压缩效果越好
     private final CompressionType compressionType;
     private final Sensor errors;
     private final Time time;
+    // key 序列化器
     private final Serializer<K> keySerializer;
+    // value 序列化器
     private final Serializer<V> valueSerializer;
+    // 配置对象，使用反射初始化KafkaProducer配置的相对对象
     private final ProducerConfig producerConfig;
+    // 等待更新Kafka集群元数据的最大时长
     private final long maxBlockTimeMs;
+    // ProducerInterceptor集合，ProducerInterceptor可以在消息发送之前对其进行拦截或修改；也可以先于用户的Callback，对ACK响应进行预处理
     private final ProducerInterceptors<K, V> interceptors;
     private final ApiVersions apiVersions;
     private final TransactionManager transactionManager;
@@ -378,6 +392,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                 this.valueSerializer = valueSerializer;
             }
 
+            // 反射实例化拦截器集合
             List<ProducerInterceptor<K, V>> interceptorList = (List) config.getConfiguredInstances(
                     ProducerConfig.INTERCEPTOR_CLASSES_CONFIG,
                     ProducerInterceptor.class,
@@ -397,6 +412,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
 
             this.apiVersions = new ApiVersions();
             this.transactionManager = configureTransactionState(config, logContext);
+            // Read: 创建RecordAccumulator实例
             this.accumulator = new RecordAccumulator(logContext,
                     config.getInt(ProducerConfig.BATCH_SIZE_CONFIG),
                     this.compressionType,
@@ -410,6 +426,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                     transactionManager,
                     new BufferPool(this.totalMemorySize, config.getInt(ProducerConfig.BATCH_SIZE_CONFIG), metrics, time, PRODUCER_METRIC_GROUP_NAME));
 
+            // Read: 创建并更新Kafka集群元数据
             List<InetSocketAddress> addresses = ClientUtils.parseAndValidateAddresses(
                     config.getList(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG),
                     config.getString(ProducerConfig.CLIENT_DNS_LOOKUP_CONFIG));
@@ -425,8 +442,10 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                 this.metadata.bootstrap(addresses);
             }
             this.errors = this.metrics.sensor("errors");
+            // Read: 创建Sender实例
             this.sender = newSender(logContext, kafkaClient, this.metadata);
             String ioThreadName = NETWORK_THREAD_PREFIX + " | " + clientId;
+            // Read: 创建并启动Sender对应的线程
             this.ioThread = new KafkaThread(ioThreadName, this.sender, true);
             this.ioThread.start();
             config.logUnused();
@@ -907,6 +926,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             long nowMs = time.milliseconds();
             ClusterAndWaitTime clusterAndWaitTime;
             try {
+                // sign-1: 获取Kafka集群的信息，底层会唤醒Send线程更新Metadata中保存的Kafka集群元数据
                 clusterAndWaitTime = waitOnMetadata(record.topic(), record.partition(), nowMs, maxBlockTimeMs);
             } catch (KafkaException e) {
                 if (metadata.isClosed())
@@ -916,6 +936,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             nowMs += clusterAndWaitTime.waitedOnMetadataMs;
             long remainingWaitMs = Math.max(0, maxBlockTimeMs - clusterAndWaitTime.waitedOnMetadataMs);
             Cluster cluster = clusterAndWaitTime.cluster;
+            // sign-2: key/value序列化
             byte[] serializedKey;
             try {
                 serializedKey = keySerializer.serialize(record.topic(), record.headers(), record.key());
@@ -945,6 +966,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             if (log.isTraceEnabled()) {
                 log.trace("Attempting to append record {} with callback {} to topic {} partition {}", record, callback, record.topic(), partition);
             }
+            // sign-3: 对消息进行拦截处理
             // producer callback will make sure to call both 'callback' and interceptor callback
             Callback interceptCallback = new InterceptorCallback<>(callback, this.interceptors, tp);
 
@@ -965,6 +987,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                 // producer callback will make sure to call both 'callback' and interceptor callback
                 interceptCallback = new InterceptorCallback<>(callback, this.interceptors, tp);
 
+                // sign-4: 消息追加到RecordAccumulator中
                 result = accumulator.append(tp, timestamp, serializedKey,
                     serializedValue, headers, interceptCallback, remainingWaitMs, false, nowMs);
             }
@@ -972,6 +995,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             if (transactionManager != null && transactionManager.isTransactional())
                 transactionManager.maybeAddPartitionToTransaction(tp);
 
+            // sign-5: 唤醒Sender线程发送消息
             if (result.batchIsFull || result.newBatchCreated) {
                 log.trace("Waking up the sender since topic {} partition {} is either full or getting a new batch", record.topic(), partition);
                 this.sender.wakeup();
