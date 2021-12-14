@@ -48,7 +48,7 @@ import org.apache.kafka.clients.consumer._
 import org.apache.kafka.clients.consumer.internals.AbstractCoordinator
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
 import org.apache.kafka.common.acl.{AccessControlEntry, AccessControlEntryFilter, AclBinding, AclBindingFilter}
-import org.apache.kafka.common.config.ConfigResource
+import org.apache.kafka.common.config.{ConfigException, ConfigResource}
 import org.apache.kafka.common.config.ConfigResource.Type.TOPIC
 import org.apache.kafka.common.errors.{KafkaStorageException, OperationNotAttemptedException, TopicExistsException, UnknownTopicOrPartitionException}
 import org.apache.kafka.common.header.Header
@@ -67,6 +67,7 @@ import org.apache.kafka.common.serialization.{ByteArrayDeserializer, ByteArraySe
 import org.apache.kafka.common.utils.Utils._
 import org.apache.kafka.common.utils.{Time, Utils}
 import org.apache.kafka.common.{KafkaFuture, TopicPartition}
+import org.apache.kafka.controller.QuorumController
 import org.apache.kafka.server.authorizer.{Authorizer => JAuthorizer}
 import org.apache.kafka.test.{TestSslUtils, TestUtils => JTestUtils}
 import org.apache.zookeeper.KeeperException.SessionExpiredException
@@ -222,7 +223,7 @@ object TestUtils extends Logging {
       brokers: Seq[B],
       protocol: SecurityProtocol = SecurityProtocol.PLAINTEXT): String = {
     brokers.map { s =>
-      val listener = s.config.advertisedListeners.find(_.securityProtocol == protocol).getOrElse(
+      val listener = s.config.effectiveAdvertisedListeners.find(_.securityProtocol == protocol).getOrElse(
         sys.error(s"Could not find listener with security protocol $protocol"))
       formatAddress(listener.host, boundPort(s, protocol))
     }.mkString(",")
@@ -230,7 +231,7 @@ object TestUtils extends Logging {
 
   def bootstrapServers[B <: KafkaBroker](brokers: Seq[B], listenerName: ListenerName): String = {
     brokers.map { s =>
-      val listener = s.config.advertisedListeners.find(_.listenerName == listenerName).getOrElse(
+      val listener = s.config.effectiveAdvertisedListeners.find(_.listenerName == listenerName).getOrElse(
         sys.error(s"Could not find listener with name ${listenerName.value}"))
       formatAddress(listener.host, s.boundPort(listenerName))
     }.mkString(",")
@@ -296,7 +297,7 @@ object TestUtils extends Logging {
       props.put(KafkaConfig.NodeIdProp, nodeId.toString)
       props.put(KafkaConfig.BrokerIdProp, nodeId.toString)
       props.put(KafkaConfig.AdvertisedListenersProp, listeners)
-      props.put(KafkaConfig.ListenersProp, listeners + ",CONTROLLER://localhost:0")
+      props.put(KafkaConfig.ListenersProp, listeners)
       props.put(KafkaConfig.ControllerListenerNamesProp, "CONTROLLER")
       props.put(KafkaConfig.ListenerSecurityProtocolMapProp, protocolAndPorts.
         map(p => "%s:%s".format(p._1, p._1)).mkString(",") + ",CONTROLLER:PLAINTEXT")
@@ -1948,6 +1949,16 @@ object TestUtils extends Logging {
       s" does not contain expected error message : $message"))
   }
 
+  def assertBadConfigContainingMessage(props: Properties, expectedExceptionContainsText: String): Unit = {
+    try {
+      KafkaConfig.fromProps(props)
+      fail("Expected illegal configuration but instead it was legal")
+    } catch {
+      case caught @ (_: ConfigException | _: IllegalArgumentException) =>
+        assertTrue(caught.getMessage.contains(expectedExceptionContainsText))
+    }
+  }
+
   def totalMetricValue(broker: KafkaBroker, metricName: String): Long = {
     totalMetricValue(broker.metrics, metricName)
   }
@@ -2144,7 +2155,8 @@ object TestUtils extends Logging {
       KafkaProducer.NETWORK_THREAD_PREFIX,
       AdminClientUnitTestEnv.kafkaAdminClientNetworkThreadPrefix(),
       AbstractCoordinator.HEARTBEAT_THREAD_PREFIX,
-      ZooKeeperTestHarness.ZkClientEventThreadSuffix
+      QuorumTestHarness.ZkClientEventThreadSuffix,
+      QuorumController.CONTROLLER_THREAD_SUFFIX
     )
 
     def unexpectedThreads: Set[String] = {

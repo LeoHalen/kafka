@@ -139,7 +139,7 @@ class BrokerServer(
 
   var clientQuotaMetadataManager: ClientQuotaMetadataManager = null
 
-  private var _brokerTopicStats: BrokerTopicStats = null
+  @volatile var brokerTopicStats: BrokerTopicStats = null
 
   val brokerFeatures: BrokerFeatures = BrokerFeatures.createDefault()
 
@@ -154,8 +154,6 @@ class BrokerServer(
   var metadataPublisher: BrokerMetadataPublisher = null
 
   def kafkaYammerMetrics: kafka.metrics.KafkaYammerMetrics = KafkaYammerMetrics.INSTANCE
-
-  private[kafka] def brokerTopicStats = _brokerTopicStats
 
   private def maybeChangeStatus(from: ProcessStatus, to: ProcessStatus): Boolean = {
     lock.lock()
@@ -178,10 +176,12 @@ class BrokerServer(
 
   def replicaManager: ReplicaManager = _replicaManager
 
-  def startup(): Unit = {
+  override def startup(): Unit = {
     if (!maybeChangeStatus(SHUTDOWN, STARTING)) return
     try {
       info("Starting broker")
+
+      config.dynamicConfig.initialize(zkClientOpt = None)
 
       lifecycleManager = new BrokerLifecycleManager(config, time, threadNamePrefix)
 
@@ -190,7 +190,7 @@ class BrokerServer(
       kafkaScheduler.startup()
 
       /* register broker metrics */
-      _brokerTopicStats = new BrokerTopicStats
+      brokerTopicStats = new BrokerTopicStats
 
       quotaManagers = QuotaFactory.instantiate(config, metrics, time, threadNamePrefix.getOrElse(""))
 
@@ -324,7 +324,7 @@ class BrokerServer(
                                                     metadataSnapshotter)
 
       val networkListeners = new ListenerCollection()
-      config.advertisedListeners.foreach { ep =>
+      config.effectiveAdvertisedListeners.foreach { ep =>
         networkListeners.add(new Listener().
           setHost(if (Utils.isBlank(ep.host)) InetAddress.getLocalHost.getCanonicalHostName else ep.host).
           setName(ep.listenerName.value()).
@@ -404,10 +404,6 @@ class BrokerServer(
         config.numIoThreads, s"${SocketServer.DataPlaneMetricPrefix}RequestHandlerAvgIdlePercent",
         SocketServer.DataPlaneThreadPrefix)
 
-      if (socketServer.controlPlaneRequestChannelOpt.isDefined) {
-        throw new RuntimeException(KafkaConfig.ControlPlaneListenerNameProp + " is not " +
-          "supported when in KRaft mode.")
-      }
       // Block until we've caught up with the latest metadata from the controller quorum.
       lifecycleManager.initialCatchUpFuture.get()
 
@@ -543,7 +539,7 @@ class BrokerServer(
     }
   }
 
-  def awaitShutdown(): Unit = {
+  override def awaitShutdown(): Unit = {
     lock.lock()
     try {
       while (true) {
