@@ -56,9 +56,9 @@ class LogSegment private[log] (val log: FileRecords,
                                val lazyOffsetIndex: LazyIndex[OffsetIndex],
                                val lazyTimeIndex: LazyIndex[TimeIndex],
                                val txnIndex: TransactionIndex,
-                               val baseOffset: Long,
-                               val indexIntervalBytes: Int,
-                               val rollJitterMs: Long,
+                               val baseOffset: Long, // 磁盘文件文件名就是baseOffset的值
+                               val indexIntervalBytes: Int, // log.index.interval.bytes
+                               val rollJitterMs: Long, // 日志段对象新增倒计时扰动值
                                val time: Time) extends Logging {
 
   def offsetIndex: OffsetIndex = lazyOffsetIndex.get
