@@ -41,8 +41,8 @@ import org.apache.kafka.common.message.AllocateProducerIdsRequestData;
 import org.apache.kafka.common.message.AllocateProducerIdsResponseData;
 import org.apache.kafka.common.message.AlterClientQuotasResponseData;
 import org.apache.kafka.common.message.AlterConfigsResponseData;
-import org.apache.kafka.common.message.AlterIsrRequestData;
-import org.apache.kafka.common.message.AlterIsrResponseData;
+import org.apache.kafka.common.message.AlterPartitionRequestData;
+import org.apache.kafka.common.message.AlterPartitionResponseData;
 import org.apache.kafka.common.message.AlterPartitionReassignmentsRequestData;
 import org.apache.kafka.common.message.AlterPartitionReassignmentsResponseData;
 import org.apache.kafka.common.message.AlterReplicaLogDirsRequestData;
@@ -237,6 +237,7 @@ import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -286,14 +287,13 @@ public class RequestResponseTest {
     // Exception includes a message that we verify is not included in error responses
     private final UnknownServerException unknownServerException = new UnknownServerException("secret");
 
-
     @Test
     public void testSerialization() {
         Map<ApiKeys, List<Short>> toSkip = new HashMap<>();
         // It's not possible to create a MetadataRequest v0 via the builder
         toSkip.put(METADATA, singletonList((short) 0));
-        // DescribeLogDirsResponse does not have a top level error field
-        toSkip.put(DESCRIBE_LOG_DIRS, DESCRIBE_LOG_DIRS.allVersions());
+        // DescribeLogDirsResponse v0, v1 and v2 don't have a top level error field
+        toSkip.put(DESCRIBE_LOG_DIRS, Arrays.asList((short) 0, (short) 1, (short) 2));
         // ElectLeaders v0 does not have a top level error field, when accessing it, it defaults to NONE
         toSkip.put(ELECT_LEADERS, singletonList((short) 0));
 
@@ -938,6 +938,7 @@ public class RequestResponseTest {
         assertEquals(1, createDescribeClientQuotasResponse().errorCounts().get(Errors.NONE));
         assertEquals(2, createDescribeConfigsResponse(DESCRIBE_CONFIGS.latestVersion()).errorCounts().get(Errors.NONE));
         assertEquals(1, createDescribeGroupResponse().errorCounts().get(Errors.NONE));
+        assertEquals(2, createDescribeLogDirsResponse().errorCounts().get(Errors.NONE));
         assertEquals(1, createDescribeTokenResponse().errorCounts().get(Errors.NONE));
         assertEquals(2, createElectLeadersResponse().errorCounts().get(Errors.NONE));
         assertEquals(1, createEndTxnResponse().errorCounts().get(Errors.NONE));
@@ -1028,7 +1029,7 @@ public class RequestResponseTest {
             case BEGIN_QUORUM_EPOCH: return createBeginQuorumEpochRequest(version);
             case END_QUORUM_EPOCH: return createEndQuorumEpochRequest(version);
             case DESCRIBE_QUORUM: return createDescribeQuorumRequest(version);
-            case ALTER_ISR: return createAlterIsrRequest(version);
+            case ALTER_PARTITION: return createAlterPartitionRequest(version);
             case UPDATE_FEATURES: return createUpdateFeaturesRequest(version);
             case ENVELOPE: return createEnvelopeRequest(version);
             case FETCH_SNAPSHOT: return createFetchSnapshotRequest(version);
@@ -1102,7 +1103,7 @@ public class RequestResponseTest {
             case BEGIN_QUORUM_EPOCH: return createBeginQuorumEpochResponse();
             case END_QUORUM_EPOCH: return createEndQuorumEpochResponse();
             case DESCRIBE_QUORUM: return createDescribeQuorumResponse();
-            case ALTER_ISR: return createAlterIsrResponse();
+            case ALTER_PARTITION: return createAlterPartitionResponse(version);
             case UPDATE_FEATURES: return createUpdateFeaturesResponse();
             case ENVELOPE: return createEnvelopeResponse();
             case FETCH_SNAPSHOT: return createFetchSnapshotResponse();
@@ -1304,33 +1305,47 @@ public class RequestResponseTest {
         return new DescribeUserScramCredentialsResponse(data);
     }
 
-    private AlterIsrRequest createAlterIsrRequest(short version) {
-        AlterIsrRequestData data = new AlterIsrRequestData()
-                .setBrokerEpoch(123L)
-                .setBrokerId(1)
-                .setTopics(singletonList(new AlterIsrRequestData.TopicData()
-                        .setName("topic1")
-                        .setPartitions(singletonList(new AlterIsrRequestData.PartitionData()
-                                .setPartitionIndex(1)
-                                .setCurrentIsrVersion(2)
-                                .setLeaderEpoch(3)
-                                .setNewIsr(asList(1, 2))))));
-        return new AlterIsrRequest.Builder(data).build(version);
+    private AlterPartitionRequest createAlterPartitionRequest(short version) {
+        AlterPartitionRequestData.PartitionData partitionData = new AlterPartitionRequestData.PartitionData()
+            .setPartitionIndex(1)
+            .setPartitionEpoch(2)
+            .setLeaderEpoch(3)
+            .setNewIsr(asList(1, 2));
+
+        if (version >= 1) {
+            // Use the none default value; 1 - RECOVERING
+            partitionData.setLeaderRecoveryState((byte) 1);
+        }
+
+        AlterPartitionRequestData data = new AlterPartitionRequestData()
+            .setBrokerEpoch(123L)
+            .setBrokerId(1)
+            .setTopics(singletonList(new AlterPartitionRequestData.TopicData()
+                .setName("topic1")
+                .setPartitions(singletonList(partitionData))));
+        return new AlterPartitionRequest.Builder(data).build(version);
     }
 
-    private AlterIsrResponse createAlterIsrResponse() {
-        AlterIsrResponseData data = new AlterIsrResponseData()
+    private AlterPartitionResponse createAlterPartitionResponse(int version) {
+        AlterPartitionResponseData.PartitionData partitionData = new AlterPartitionResponseData.PartitionData()
+            .setPartitionEpoch(1)
+            .setIsr(asList(0, 1, 2))
+            .setErrorCode(Errors.NONE.code())
+            .setLeaderEpoch(2)
+            .setLeaderId(3);
+
+        if (version >= 1) {
+            // Use the none default value; 1 - RECOVERING
+            partitionData.setLeaderRecoveryState((byte) 1);
+        }
+
+        AlterPartitionResponseData data = new AlterPartitionResponseData()
                 .setErrorCode(Errors.NONE.code())
                 .setThrottleTimeMs(123)
-                .setTopics(singletonList(new AlterIsrResponseData.TopicData()
+                .setTopics(singletonList(new AlterPartitionResponseData.TopicData()
                         .setName("topic1")
-                        .setPartitions(singletonList(new AlterIsrResponseData.PartitionData()
-                                .setCurrentIsrVersion(1)
-                                .setIsr(asList(0, 1, 2))
-                                .setErrorCode(Errors.NONE.code())
-                                .setLeaderEpoch(2)
-                                .setLeaderId(3)))));
-        return new AlterIsrResponse(data);
+                        .setPartitions(singletonList(partitionData))));
+        return new AlterPartitionResponse(data);
     }
 
     private UpdateFeaturesRequest createUpdateFeaturesRequest(short version) {
@@ -1715,7 +1730,8 @@ public class RequestResponseTest {
             .setSessionTimeoutMs(30000)
             .setMemberId("consumer1")
             .setProtocolType("consumer")
-            .setProtocols(protocols);
+            .setProtocols(protocols)
+            .setReason("reason: test");
 
         // v1 and above contains rebalance timeout
         if (version >= 1)
@@ -1837,7 +1853,8 @@ public class RequestResponseTest {
     }
 
     private LeaveGroupRequest createLeaveGroupRequest(short version) {
-        return new LeaveGroupRequest.Builder("group1", singletonList(new MemberIdentity().setMemberId("consumer1")))
+        MemberIdentity member = new MemberIdentity().setMemberId("consumer1").setReason("reason: test");
+        return new LeaveGroupRequest.Builder("group1", Collections.singletonList(member))
                 .build(version);
     }
 

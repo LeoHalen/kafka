@@ -293,11 +293,11 @@ class ControllerApisTest {
   }
 
   @Test
-  def testUnauthorizedHandleAlterIsrRequest(): Unit = {
+  def testUnauthorizedHandleAlterPartitionRequest(): Unit = {
     assertThrows(classOf[ClusterAuthorizationException], () => createControllerApis(
       Some(createDenyAllAuthorizer()), new MockController.Builder().build()).
-        handleAlterIsrRequest(buildRequest(new AlterIsrRequest.Builder(
-          new AlterIsrRequestData()).build(0))))
+        handleAlterPartitionRequest(buildRequest(new AlterPartitionRequest.Builder(
+          new AlterPartitionRequestData()).build(0))))
   }
 
   @Test
@@ -497,6 +497,7 @@ class ControllerApisTest {
         new CreatableTopic().setName("bar").setNumPartitions(2).setReplicationFactor(3),
         new CreatableTopic().setName("bar").setNumPartitions(2).setReplicationFactor(3),
         new CreatableTopic().setName("baz").setNumPartitions(2).setReplicationFactor(3),
+        new CreatableTopic().setName("indescribable").setNumPartitions(2).setReplicationFactor(3),
         new CreatableTopic().setName("quux").setNumPartitions(2).setReplicationFactor(3),
     ).iterator()))
     val expectedResponse = Set(new CreatableTopicResult().setName("foo").
@@ -507,11 +508,19 @@ class ControllerApisTest {
         setErrorMessage("Duplicate topic name."),
       new CreatableTopicResult().setName("baz").
         setErrorCode(NONE.code()).
-        setTopicId(new Uuid(0L, 1L)),
+        setTopicId(new Uuid(0L, 1L)).
+        setNumPartitions(2).
+        setReplicationFactor(3).
+        setTopicConfigErrorCode(NONE.code()),
+      new CreatableTopicResult().setName("indescribable").
+        setErrorCode(NONE.code()).
+        setTopicId(new Uuid(0L, 2L)).
+        setTopicConfigErrorCode(TOPIC_AUTHORIZATION_FAILED.code()),
       new CreatableTopicResult().setName("quux").
         setErrorCode(TOPIC_AUTHORIZATION_FAILED.code()))
     assertEquals(expectedResponse, controllerApis.createTopics(request,
       false,
+      _ => Set("baz", "indescribable"),
       _ => Set("baz")).get().topics().asScala.toSet)
   }
 
@@ -727,7 +736,45 @@ class ControllerApisTest {
       new CreatePartitionsTopicResult().setName("baz").
         setErrorCode(TOPIC_AUTHORIZATION_FAILED.code()).
         setErrorMessage(null)),
-      controllerApis.createPartitions(request, false, _ => Set("foo", "bar")).get().asScala.toSet)
+      controllerApis.createPartitions(request, _ => Set("foo", "bar")).get().asScala.toSet)
+  }
+
+  @Test
+  def testCreatePartitionsAuthorization(): Unit = {
+    val controller = new MockController.Builder()
+      .newInitialTopic("foo", Uuid.fromString("vZKYST0pSA2HO5x_6hoO2Q"))
+      .build()
+    val authorizer = mock(classOf[Authorizer])
+    val controllerApis = createControllerApis(Some(authorizer), controller)
+
+    val requestData = new CreatePartitionsRequestData()
+    requestData.topics().add(new CreatePartitionsTopic().setName("foo").setAssignments(null).setCount(2))
+    requestData.topics().add(new CreatePartitionsTopic().setName("bar").setAssignments(null).setCount(10))
+    val request = new CreatePartitionsRequest.Builder(requestData).build()
+
+    val fooResource = new ResourcePattern(ResourceType.TOPIC, "foo", PatternType.LITERAL)
+    val fooAction = new Action(AclOperation.ALTER, fooResource, 1, true, true)
+
+    val barResource = new ResourcePattern(ResourceType.TOPIC, "bar", PatternType.LITERAL)
+    val barAction = new Action(AclOperation.ALTER, barResource, 1, true, true)
+
+    when(authorizer.authorize(
+      any[RequestContext],
+      any[util.List[Action]]
+    )).thenAnswer { invocation =>
+      val actions = invocation.getArgument[util.List[Action]](1).asScala
+      val results = actions.map { action =>
+        if (action == fooAction) AuthorizationResult.ALLOWED
+        else if (action == barAction) AuthorizationResult.DENIED
+        else throw new AssertionError(s"Unexpected action $action")
+      }
+      new util.ArrayList[AuthorizationResult](results.asJava)
+    }
+
+    val response = handleRequest[CreatePartitionsResponse](request, controllerApis)
+    val results = response.data.results.asScala
+    assertEquals(Some(Errors.NONE), results.find(_.name == "foo").map(result => Errors.forCode(result.errorCode)))
+    assertEquals(Some(Errors.TOPIC_AUTHORIZATION_FAILED), results.find(_.name == "bar").map(result => Errors.forCode(result.errorCode)))
   }
 
   @Test

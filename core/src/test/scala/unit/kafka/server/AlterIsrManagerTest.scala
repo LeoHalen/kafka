@@ -18,24 +18,31 @@
 package kafka.server
 
 import java.util.Collections
-
+import java.util.stream.{Stream => JStream}
+import kafka.api.ApiVersion
+import kafka.api.KAFKA_2_7_IV2
+import kafka.api.KAFKA_3_2_IV0
 import kafka.api.LeaderAndIsr
 import kafka.utils.{MockScheduler, MockTime}
 import kafka.zk.KafkaZkClient
 import org.apache.kafka.clients.ClientResponse
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.errors.{AuthenticationException, InvalidUpdateVersionException, OperationNotAttemptedException, UnknownServerException, UnsupportedVersionException}
-import org.apache.kafka.common.message.AlterIsrResponseData
+import org.apache.kafka.common.message.AlterPartitionResponseData
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.protocol.{ApiKeys, Errors}
-import org.apache.kafka.common.requests.{AbstractRequest, AlterIsrRequest, AlterIsrResponse}
+import org.apache.kafka.common.requests.{AbstractRequest, AlterPartitionRequest, AlterPartitionResponse}
+import org.apache.kafka.metadata.LeaderRecoveryState
 import org.apache.kafka.test.TestUtils.assertFutureThrows
-import org.easymock.EasyMock
 import org.junit.jupiter.api.Assertions._
-import org.junit.jupiter.api.{BeforeEach, Test}
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.Arguments
+import org.junit.jupiter.params.provider.MethodSource
 import org.mockito.ArgumentMatchers.{any, anyString}
+import org.mockito.Mockito.{mock, reset, times, verify}
 import org.mockito.{ArgumentCaptor, ArgumentMatchers, Mockito}
-
 import scala.jdk.CollectionConverters._
 
 class AlterIsrManagerTest {
@@ -53,54 +60,71 @@ class AlterIsrManagerTest {
 
   @BeforeEach
   def setup(): Unit = {
-    brokerToController = EasyMock.createMock(classOf[BrokerToControllerChannelManager])
+    brokerToController = mock(classOf[BrokerToControllerChannelManager])
   }
 
-  @Test
-  def testBasic(): Unit = {
-    EasyMock.expect(brokerToController.start())
-    EasyMock.expect(brokerToController.sendRequest(EasyMock.anyObject(), EasyMock.anyObject())).once()
-    EasyMock.replay(brokerToController)
-
+  @ParameterizedTest
+  @MethodSource(Array("provideApiVersions"))
+  def testBasic(apiVersion: ApiVersion): Unit = {
     val scheduler = new MockScheduler(time)
-    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2)
+    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2, apiVersion)
     alterIsrManager.start()
-    alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
-    EasyMock.verify(brokerToController)
+    alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 10), 0)
+    verify(brokerToController).start()
+    verify(brokerToController).sendRequest(any(), any())
   }
 
-  @Test
-  def testOverwriteWithinBatch(): Unit = {
-    val capture = EasyMock.newCapture[AbstractRequest.Builder[AlterIsrRequest]]()
-    val callbackCapture = EasyMock.newCapture[ControllerRequestCompletionHandler]()
-
-    EasyMock.expect(brokerToController.start())
-    EasyMock.expect(brokerToController.sendRequest(EasyMock.capture(capture), EasyMock.capture(callbackCapture))).times(2)
-    EasyMock.replay(brokerToController)
+  @ParameterizedTest
+  @MethodSource(Array("provideLeaderRecoveryState"))
+  def testBasicSentLeaderRecoveryState(
+    apiVersion: ApiVersion,
+    leaderRecoveryState: LeaderRecoveryState
+  ): Unit = {
+    val requestCapture = ArgumentCaptor.forClass(classOf[AbstractRequest.Builder[AlterPartitionRequest]])
 
     val scheduler = new MockScheduler(time)
-    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2)
+    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2, apiVersion)
+    alterIsrManager.start()
+    alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1), leaderRecoveryState, 10), 0)
+    verify(brokerToController).start()
+    verify(brokerToController).sendRequest(requestCapture.capture(), any())
+
+    val request = requestCapture.getValue.build()
+    val expectedLeaderRecoveryState = if (apiVersion >= KAFKA_3_2_IV0) leaderRecoveryState else LeaderRecoveryState.RECOVERED
+    assertEquals(expectedLeaderRecoveryState.value, request.data.topics.get(0).partitions.get(0).leaderRecoveryState())
+  }
+
+  @ParameterizedTest
+  @MethodSource(Array("provideApiVersions"))
+  def testOverwriteWithinBatch(apiVersion: ApiVersion): Unit = {
+    val capture: ArgumentCaptor[AbstractRequest.Builder[AlterPartitionRequest]] = ArgumentCaptor.forClass(classOf[AbstractRequest.Builder[AlterPartitionRequest]])
+    val callbackCapture: ArgumentCaptor[ControllerRequestCompletionHandler] = ArgumentCaptor.forClass(classOf[ControllerRequestCompletionHandler])
+
+    val scheduler = new MockScheduler(time)
+    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2, apiVersion)
     alterIsrManager.start()
 
     // Only send one ISR update for a given topic+partition
-    val firstSubmitFuture = alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+    val firstSubmitFuture = alterIsrManager.submit(tp0, LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 10), 0)
     assertFalse(firstSubmitFuture.isDone)
 
-    val failedSubmitFuture = alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2), 10), 0)
+    val failedSubmitFuture = alterIsrManager.submit(tp0, LeaderAndIsr(1, 1, List(1,2), LeaderRecoveryState.RECOVERED, 10), 0)
     assertTrue(failedSubmitFuture.isCompletedExceptionally)
     assertFutureThrows(failedSubmitFuture, classOf[OperationNotAttemptedException])
 
     // Simulate response
-    val alterIsrResp = partitionResponse(tp0, Errors.NONE)
+    val alterPartitionResp = partitionResponse(tp0, Errors.NONE)
     val resp = new ClientResponse(null, null, "", 0L, 0L,
-      false, null, null, alterIsrResp)
+      false, null, null, alterPartitionResp)
+    verify(brokerToController).sendRequest(capture.capture(), callbackCapture.capture())
     callbackCapture.getValue.onComplete(resp)
 
     // Now we can submit this partition again
-    val newSubmitFuture = alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1), 10), 0)
+    val newSubmitFuture = alterIsrManager.submit(tp0, LeaderAndIsr(1, 1, List(1), LeaderRecoveryState.RECOVERED, 10), 0)
     assertFalse(newSubmitFuture.isDone)
 
-    EasyMock.verify(brokerToController)
+    verify(brokerToController).start()
+    verify(brokerToController, times(2)).sendRequest(capture.capture(), callbackCapture.capture())
 
     // Make sure we sent the right request ISR={1}
     val request = capture.getValue.build()
@@ -108,38 +132,37 @@ class AlterIsrManagerTest {
     assertEquals(request.data().topics().get(0).partitions().get(0).newIsr().size(), 1)
   }
 
-  @Test
-  def testSingleBatch(): Unit = {
-    val capture = EasyMock.newCapture[AbstractRequest.Builder[AlterIsrRequest]]()
-    val callbackCapture = EasyMock.newCapture[ControllerRequestCompletionHandler]()
-
-    EasyMock.expect(brokerToController.start())
-    EasyMock.expect(brokerToController.sendRequest(EasyMock.capture(capture), EasyMock.capture(callbackCapture))).times(2)
-    EasyMock.replay(brokerToController)
+  @ParameterizedTest
+  @MethodSource(Array("provideApiVersions"))
+  def testSingleBatch(apiVersion: ApiVersion): Unit = {
+    val capture: ArgumentCaptor[AbstractRequest.Builder[AlterPartitionRequest]] = ArgumentCaptor.forClass(classOf[AbstractRequest.Builder[AlterPartitionRequest]])
+    val callbackCapture: ArgumentCaptor[ControllerRequestCompletionHandler] = ArgumentCaptor.forClass(classOf[ControllerRequestCompletionHandler])
 
     val scheduler = new MockScheduler(time)
-    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2)
+    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2, apiVersion)
     alterIsrManager.start()
 
     // First request will send batch of one
     alterIsrManager.submit(new TopicPartition(topic, 0),
-      new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+      LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 10), 0)
 
     // Other submissions will queue up until a response
     for (i <- 1 to 9) {
       alterIsrManager.submit(new TopicPartition(topic, i),
-        new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+        LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 10), 0)
     }
 
     // Simulate response, omitting partition 0 will allow it to stay in unsent queue
-    val alterIsrResp = new AlterIsrResponse(new AlterIsrResponseData())
+    val alterPartitionResp = new AlterPartitionResponse(new AlterPartitionResponseData())
     val resp = new ClientResponse(null, null, "", 0L, 0L,
-      false, null, null, alterIsrResp)
+      false, null, null, alterPartitionResp)
 
     // On the callback, we check for unsent items and send another request
+    verify(brokerToController).sendRequest(capture.capture(), callbackCapture.capture())
     callbackCapture.getValue.onComplete(resp)
 
-    EasyMock.verify(brokerToController)
+    verify(brokerToController).start()
+    verify(brokerToController, times(2)).sendRequest(capture.capture(), callbackCapture.capture())
 
     // Verify the last request sent had all 10 items
     val request = capture.getValue.build()
@@ -175,47 +198,41 @@ class AlterIsrManagerTest {
   }
 
   private def testRetryOnTopLevelError(error: Errors): Unit = {
-    val alterIsrResp = new AlterIsrResponse(new AlterIsrResponseData().setErrorCode(error.code))
+    val alterPartitionResp = new AlterPartitionResponse(new AlterPartitionResponseData().setErrorCode(error.code))
     val response = new ClientResponse(null, null, "", 0L, 0L,
-      false, null, null, alterIsrResp)
+      false, null, null, alterPartitionResp)
     testRetryOnErrorResponse(response)
   }
 
   private def testRetryOnErrorResponse(response: ClientResponse): Unit = {
-    val leaderAndIsr = new LeaderAndIsr(1, 1, List(1,2,3), 10)
-    val callbackCapture = EasyMock.newCapture[ControllerRequestCompletionHandler]()
-
-    EasyMock.expect(brokerToController.start())
-    EasyMock.expect(brokerToController.sendRequest(EasyMock.anyObject(), EasyMock.capture(callbackCapture))).times(1)
-    EasyMock.replay(brokerToController)
+    val leaderAndIsr = new LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 10)
+    val callbackCapture: ArgumentCaptor[ControllerRequestCompletionHandler] = ArgumentCaptor.forClass(classOf[ControllerRequestCompletionHandler])
 
     val scheduler = new MockScheduler(time)
-    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2)
+    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2, KAFKA_3_2_IV0)
     alterIsrManager.start()
     alterIsrManager.submit(tp0, leaderAndIsr, 0)
 
-    EasyMock.verify(brokerToController)
-
+    verify(brokerToController).start()
+    verify(brokerToController).sendRequest(any(), callbackCapture.capture())
     callbackCapture.getValue.onComplete(response)
 
     // Any top-level error, we want to retry, so we don't clear items from the pending map
     assertTrue(alterIsrManager.unsentIsrUpdates.containsKey(tp0))
 
-    EasyMock.reset(brokerToController)
-    EasyMock.expect(brokerToController.sendRequest(EasyMock.anyObject(), EasyMock.capture(callbackCapture))).times(1)
-    EasyMock.replay(brokerToController)
+    reset(brokerToController)
 
     // After some time, we will retry failed requests
     time.sleep(100)
     scheduler.tick()
 
     // After a successful response, we can submit another AlterIsrItem
-    val retryAlterIsrResponse = partitionResponse(tp0, Errors.NONE)
+    val retryAlterPartitionResponse = partitionResponse(tp0, Errors.NONE)
     val retryResponse = new ClientResponse(null, null, "", 0L, 0L,
-      false, null, null, retryAlterIsrResponse)
-    callbackCapture.getValue.onComplete(retryResponse)
+      false, null, null, retryAlterPartitionResponse)
 
-    EasyMock.verify(brokerToController)
+    verify(brokerToController).sendRequest(any(), callbackCapture.capture())
+    callbackCapture.getValue.onComplete(retryResponse)
 
     assertFalse(alterIsrManager.unsentIsrUpdates.containsKey(tp0))
   }
@@ -235,85 +252,85 @@ class AlterIsrManagerTest {
     checkPartitionError(Errors.NOT_LEADER_OR_FOLLOWER)
   }
 
+  @Test
+  def testInvalidRequest(): Unit = {
+    checkPartitionError(Errors.INVALID_REQUEST)
+  }
+
   private def checkPartitionError(error: Errors): Unit = {
     val alterIsrManager = testPartitionError(tp0, error)
     // Any partition-level error should clear the item from the pending queue allowing for future updates
-    val future = alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+    val future = alterIsrManager.submit(tp0, LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 10), 0)
     assertFalse(future.isDone)
   }
 
   private def testPartitionError(tp: TopicPartition, error: Errors): AlterIsrManager = {
-    val callbackCapture = EasyMock.newCapture[ControllerRequestCompletionHandler]()
-    EasyMock.reset(brokerToController)
-    EasyMock.expect(brokerToController.start())
-    EasyMock.expect(brokerToController.sendRequest(EasyMock.anyObject(), EasyMock.capture(callbackCapture))).once()
-    EasyMock.replay(brokerToController)
+    val callbackCapture: ArgumentCaptor[ControllerRequestCompletionHandler] = ArgumentCaptor.forClass(classOf[ControllerRequestCompletionHandler])
+    reset(brokerToController)
 
     val scheduler = new MockScheduler(time)
-    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2)
+    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2, KAFKA_3_2_IV0)
     alterIsrManager.start()
 
-    val future = alterIsrManager.submit(tp, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+    val future = alterIsrManager.submit(tp, LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 10), 0)
 
-    EasyMock.verify(brokerToController)
-    EasyMock.reset(brokerToController)
+    verify(brokerToController).start()
+    verify(brokerToController).sendRequest(any(), callbackCapture.capture())
+    reset(brokerToController)
 
-    val alterIsrResp = partitionResponse(tp, error)
+    val alterPartitionResp = partitionResponse(tp, error)
     val resp = new ClientResponse(null, null, "", 0L, 0L,
-      false, null, null, alterIsrResp)
+      false, null, null, alterPartitionResp)
     callbackCapture.getValue.onComplete(resp)
     assertTrue(future.isCompletedExceptionally)
     assertFutureThrows(future, error.exception.getClass)
     alterIsrManager
   }
 
-  @Test
-  def testOneInFlight(): Unit = {
-    val callbackCapture = EasyMock.newCapture[ControllerRequestCompletionHandler]()
-    EasyMock.reset(brokerToController)
-    EasyMock.expect(brokerToController.start())
-    EasyMock.expect(brokerToController.sendRequest(EasyMock.anyObject(), EasyMock.capture(callbackCapture))).once()
-    EasyMock.replay(brokerToController)
+  @ParameterizedTest
+  @MethodSource(Array("provideApiVersions"))
+  def testOneInFlight(apiVersion: ApiVersion): Unit = {
+    val callbackCapture: ArgumentCaptor[ControllerRequestCompletionHandler] = ArgumentCaptor.forClass(classOf[ControllerRequestCompletionHandler])
 
     val scheduler = new MockScheduler(time)
-    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2)
+    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => 2, apiVersion)
     alterIsrManager.start()
 
     // First submit will send the request
-    alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+    alterIsrManager.submit(tp0, LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 10), 0)
 
     // These will become pending unsent items
-    alterIsrManager.submit(tp1, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
-    alterIsrManager.submit(tp2, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+    alterIsrManager.submit(tp1, LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 10), 0)
+    alterIsrManager.submit(tp2, LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 10), 0)
 
-    EasyMock.verify(brokerToController)
+    verify(brokerToController).start()
+    verify(brokerToController).sendRequest(any(), callbackCapture.capture())
 
     // Once the callback runs, another request will be sent
-    EasyMock.reset(brokerToController)
-    EasyMock.expect(brokerToController.sendRequest(EasyMock.anyObject(), EasyMock.capture(callbackCapture))).once()
-    EasyMock.replay(brokerToController)
-    val alterIsrResp = new AlterIsrResponse(new AlterIsrResponseData())
+    reset(brokerToController)
+
+    val alterPartitionResp = new AlterPartitionResponse(new AlterPartitionResponseData())
     val resp = new ClientResponse(null, null, "", 0L, 0L,
-      false, null, null, alterIsrResp)
+      false, null, null, alterPartitionResp)
     callbackCapture.getValue.onComplete(resp)
-    EasyMock.verify(brokerToController)
   }
 
-  @Test
-  def testPartitionMissingInResponse(): Unit = {
+  @ParameterizedTest
+  @MethodSource(Array("provideApiVersions"))
+  def testPartitionMissingInResponse(apiVersion: ApiVersion): Unit = {
     brokerToController = Mockito.mock(classOf[BrokerToControllerChannelManager])
 
     val brokerEpoch = 2
     val scheduler = new MockScheduler(time)
-    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => brokerEpoch)
+    val alterIsrManager = new DefaultAlterIsrManager(brokerToController, scheduler, time, brokerId, () => brokerEpoch, apiVersion)
     alterIsrManager.start()
 
     def matchesAlterIsr(topicPartitions: Set[TopicPartition]): AbstractRequest.Builder[_ <: AbstractRequest] = {
       ArgumentMatchers.argThat[AbstractRequest.Builder[_ <: AbstractRequest]] { request =>
-        assertEquals(ApiKeys.ALTER_ISR, request.apiKey())
-        val alterIsrRequest = request.asInstanceOf[AlterIsrRequest.Builder].build()
+        assertEquals(ApiKeys.ALTER_PARTITION, request.apiKey())
+        val alterPartitionRequest = request.asInstanceOf[AlterPartitionRequest.Builder].build()
 
-        val requestTopicPartitions = alterIsrRequest.data.topics.asScala.flatMap { topicData =>
+        val requestTopicPartitions = alterPartitionRequest.data.topics.asScala.flatMap { topicData =>
           val topic = topicData.name
           topicData.partitions.asScala.map(partitionData => new TopicPartition(topic, partitionData.partitionIndex))
         }.toSet
@@ -340,12 +357,12 @@ class AlterIsrManagerTest {
     }
 
     // The first `submit` will send the `AlterIsr` request
-    val future1 = alterIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+    val future1 = alterIsrManager.submit(tp0, LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 10), 0)
     val callback1 = verifySendAlterIsr(Set(tp0))
 
     // Additional calls while the `AlterIsr` request is inflight will be queued
-    val future2 = alterIsrManager.submit(tp1, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
-    val future3 = alterIsrManager.submit(tp2, new LeaderAndIsr(1, 1, List(1,2,3), 10), 0)
+    val future2 = alterIsrManager.submit(tp1, LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 10), 0)
+    val future3 = alterIsrManager.submit(tp2, LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 10), 0)
 
     // Respond to the first request, which will also allow the next request to get sent
     callback1.onComplete(clientResponse(tp0, Errors.UNKNOWN_SERVER_ERROR))
@@ -382,24 +399,45 @@ class AlterIsrManagerTest {
     zkIsrManager.start()
 
     // Correct ZK version
-    val future1 = zkIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 1), 0)
+    val future1 = zkIsrManager.submit(tp0, LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 1), 0)
     assertTrue(future1.isDone)
-    assertEquals(new LeaderAndIsr(1, 1, List(1,2,3), 2), future1.get)
+    assertEquals(LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 2), future1.get)
 
     // Wrong ZK version
-    val future2 = zkIsrManager.submit(tp0, new LeaderAndIsr(1, 1, List(1,2,3), 3), 0)
+    val future2 = zkIsrManager.submit(tp0, LeaderAndIsr(1, 1, List(1,2,3), LeaderRecoveryState.RECOVERED, 3), 0)
     assertTrue(future2.isCompletedExceptionally)
     assertFutureThrows(future2, classOf[InvalidUpdateVersionException])
   }
 
-  private def partitionResponse(tp: TopicPartition, error: Errors): AlterIsrResponse = {
-    new AlterIsrResponse(new AlterIsrResponseData()
+  private def partitionResponse(tp: TopicPartition, error: Errors): AlterPartitionResponse = {
+    new AlterPartitionResponse(new AlterPartitionResponseData()
       .setTopics(Collections.singletonList(
-        new AlterIsrResponseData.TopicData()
+        new AlterPartitionResponseData.TopicData()
           .setName(tp.topic())
           .setPartitions(Collections.singletonList(
-            new AlterIsrResponseData.PartitionData()
+            new AlterPartitionResponseData.PartitionData()
               .setPartitionIndex(tp.partition())
               .setErrorCode(error.code))))))
+  }
+}
+
+object AlterIsrManagerTest {
+  def provideApiVersions(): JStream[ApiVersion] = {
+    JStream.of(
+      // Supports KIP-704: unclean leader recovery
+      KAFKA_3_2_IV0,
+      // Supports KIP-497: alter partition
+      KAFKA_2_7_IV2
+    )
+  }
+
+  def provideLeaderRecoveryState(): JStream[Arguments] = {
+    // Multiply apiVersions by leaderRecoveryState
+    provideApiVersions().flatMap { apiVersion =>
+      JStream.of(
+        Arguments.of(apiVersion, LeaderRecoveryState.RECOVERED),
+        Arguments.of(apiVersion, LeaderRecoveryState.RECOVERING)
+      )
+    }
   }
 }

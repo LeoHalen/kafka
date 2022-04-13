@@ -29,7 +29,7 @@ import kafka.server.QuotaFactory.QuotaManagers
 import kafka.utils.Logging
 import org.apache.kafka.clients.admin.AlterConfigOp
 import org.apache.kafka.common.Uuid.ZERO_UUID
-import org.apache.kafka.common.acl.AclOperation.{ALTER, ALTER_CONFIGS, CLUSTER_ACTION, CREATE, DELETE, DESCRIBE}
+import org.apache.kafka.common.acl.AclOperation.{ALTER, ALTER_CONFIGS, CLUSTER_ACTION, CREATE, DELETE, DESCRIBE, DESCRIBE_CONFIGS}
 import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.errors.{ApiException, ClusterAuthorizationException, InvalidRequestException, TopicDeletionDisabledException}
 import org.apache.kafka.common.internals.FatalExitError
@@ -91,7 +91,7 @@ class ControllerApis(val requestChannel: RequestChannel,
         case ApiKeys.BEGIN_QUORUM_EPOCH => handleBeginQuorumEpoch(request)
         case ApiKeys.END_QUORUM_EPOCH => handleEndQuorumEpoch(request)
         case ApiKeys.DESCRIBE_QUORUM => handleDescribeQuorum(request)
-        case ApiKeys.ALTER_ISR => handleAlterIsrRequest(request)
+        case ApiKeys.ALTER_PARTITION => handleAlterPartitionRequest(request)
         case ApiKeys.BROKER_REGISTRATION => handleBrokerRegistration(request)
         case ApiKeys.BROKER_HEARTBEAT => handleBrokerHeartBeatRequest(request)
         case ApiKeys.UNREGISTER_BROKER => handleUnregisterBroker(request)
@@ -112,8 +112,12 @@ class ControllerApis(val requestChannel: RequestChannel,
       }
     } catch {
       case e: FatalExitError => throw e
-      case e: ExecutionException => requestHelper.handleError(request, e.getCause)
-      case e: Throwable => requestHelper.handleError(request, e)
+      case e: Throwable => {
+        val t = if (e.isInstanceOf[ExecutionException]) e.getCause() else e
+        error(s"Unexpected error handling request ${request.requestDesc(true)} " +
+          s"with context ${request.context}", t)
+        requestHelper.handleError(request, t)
+      }
     }
   }
 
@@ -152,7 +156,7 @@ class ControllerApis(val requestChannel: RequestChannel,
     val deleteTopicsRequest = request.body[DeleteTopicsRequest]
     val future = deleteTopics(deleteTopicsRequest.data,
       request.context.apiVersion,
-      authHelper.authorize(request.context, DELETE, CLUSTER, CLUSTER_NAME),
+      authHelper.authorize(request.context, DELETE, CLUSTER, CLUSTER_NAME, logIfDenied = false),
       names => authHelper.filterByAuthorized(request.context, DESCRIBE, TOPIC, names)(n => n),
       names => authHelper.filterByAuthorized(request.context, DELETE, TOPIC, names)(n => n))
     future.whenComplete { (results, exception) =>
@@ -311,8 +315,10 @@ class ControllerApis(val requestChannel: RequestChannel,
   def handleCreateTopics(request: RequestChannel.Request): Unit = {
     val createTopicsRequest = request.body[CreateTopicsRequest]
     val future = createTopics(createTopicsRequest.data(),
-        authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME),
-        names => authHelper.filterByAuthorized(request.context, CREATE, TOPIC, names)(identity))
+        authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME, logIfDenied = false),
+        names => authHelper.filterByAuthorized(request.context, CREATE, TOPIC, names)(identity),
+        names => authHelper.filterByAuthorized(request.context, DESCRIBE_CONFIGS, TOPIC,
+            names, logIfDenied = false)(identity))
     future.whenComplete { (result, exception) =>
       requestHelper.sendResponseMaybeThrottle(request, throttleTimeMs => {
         if (exception != null) {
@@ -325,10 +331,12 @@ class ControllerApis(val requestChannel: RequestChannel,
     }
   }
 
-  def createTopics(request: CreateTopicsRequestData,
-                   hasClusterAuth: Boolean,
-                   getCreatableTopics: Iterable[String] => Set[String])
-                   : CompletableFuture[CreateTopicsResponseData] = {
+  def createTopics(
+    request: CreateTopicsRequestData,
+    hasClusterAuth: Boolean,
+    getCreatableTopics: Iterable[String] => Set[String],
+    getDescribableTopics: Iterable[String] => Set[String]
+  ): CompletableFuture[CreateTopicsResponseData] = {
     val topicNames = new util.HashSet[String]()
     val duplicateTopicNames = new util.HashSet[String]()
     request.topics().forEach { topicData =>
@@ -344,6 +352,7 @@ class ControllerApis(val requestChannel: RequestChannel,
     } else {
       getCreatableTopics.apply(topicNames.asScala)
     }
+    val describableTopicNames = getDescribableTopics.apply(topicNames.asScala).asJava
     val effectiveRequest = request.duplicate()
     val iterator = effectiveRequest.topics().iterator()
     while (iterator.hasNext) {
@@ -353,7 +362,7 @@ class ControllerApis(val requestChannel: RequestChannel,
         iterator.remove()
       }
     }
-    controller.createTopics(effectiveRequest).thenApply { response =>
+    controller.createTopics(effectiveRequest, describableTopicNames).thenApply { response =>
       duplicateTopicNames.forEach { name =>
         response.topics().add(new CreatableTopicResult().
           setName(name).
@@ -506,15 +515,15 @@ class ControllerApis(val requestChannel: RequestChannel,
     }
   }
 
-  def handleAlterIsrRequest(request: RequestChannel.Request): Unit = {
-    val alterIsrRequest = request.body[AlterIsrRequest]
+  def handleAlterPartitionRequest(request: RequestChannel.Request): Unit = {
+    val alterPartitionRequest = request.body[AlterPartitionRequest]
     authHelper.authorizeClusterOperation(request, CLUSTER_ACTION)
-    val future = controller.alterIsr(alterIsrRequest.data)
+    val future = controller.alterPartition(alterPartitionRequest.data)
     future.whenComplete { (result, exception) =>
       val response = if (exception != null) {
-        alterIsrRequest.getErrorResponse(exception)
+        alterPartitionRequest.getErrorResponse(exception)
       } else {
-        new AlterIsrResponse(result)
+        new AlterPartitionResponse(result)
       }
       requestHelper.sendResponseExemptThrottle(request, response)
     }
@@ -683,9 +692,15 @@ class ControllerApis(val requestChannel: RequestChannel,
   }
 
   def handleCreatePartitions(request: RequestChannel.Request): Unit = {
-    val future = createPartitions(request.body[CreatePartitionsRequest].data,
-      authHelper.authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME),
-      names => authHelper.filterByAuthorized(request.context, CREATE, TOPIC, names)(n => n))
+    def filterAlterAuthorizedTopics(topics: Iterable[String]): Set[String] = {
+      authHelper.filterByAuthorized(request.context, ALTER, TOPIC, topics)(n => n)
+    }
+
+    val future = createPartitions(
+      request.body[CreatePartitionsRequest].data,
+      filterAlterAuthorizedTopics
+    )
+
     future.whenComplete { (responses, exception) =>
       if (exception != null) {
         requestHelper.handleError(request, exception)
@@ -700,10 +715,10 @@ class ControllerApis(val requestChannel: RequestChannel,
     }
   }
 
-  def createPartitions(request: CreatePartitionsRequestData,
-                       hasClusterAuth: Boolean,
-                       getCreatableTopics: Iterable[String] => Set[String])
-                       : CompletableFuture[util.List[CreatePartitionsTopicResult]] = {
+  def createPartitions(
+    request: CreatePartitionsRequestData,
+    getAlterAuthorizedTopics: Iterable[String] => Set[String]
+  ): CompletableFuture[util.List[CreatePartitionsTopicResult]] = {
     val deadlineNs = time.nanoseconds() + NANOSECONDS.convert(request.timeoutMs, MILLISECONDS);
     val responses = new util.ArrayList[CreatePartitionsTopicResult]()
     val duplicateTopicNames = new util.HashSet[String]()
@@ -721,13 +736,7 @@ class ControllerApis(val requestChannel: RequestChannel,
         setErrorMessage("Duplicate topic name."))
         topicNames.remove(topicName)
     }
-    val authorizedTopicNames = {
-      if (hasClusterAuth) {
-        topicNames.asScala
-      } else {
-        getCreatableTopics(topicNames.asScala)
-      }
-    }
+    val authorizedTopicNames = getAlterAuthorizedTopics(topicNames.asScala)
     val topics = new util.ArrayList[CreatePartitionsTopic]
     topicNames.forEach { topicName =>
       if (authorizedTopicNames.contains(topicName)) {

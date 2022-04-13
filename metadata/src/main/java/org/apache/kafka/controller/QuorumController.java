@@ -19,17 +19,19 @@ package org.apache.kafka.controller;
 
 import org.apache.kafka.clients.admin.AlterConfigOp.OpType;
 import org.apache.kafka.common.Uuid;
-import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.acl.AclBinding;
+import org.apache.kafka.common.acl.AclBindingFilter;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.errors.ApiException;
 import org.apache.kafka.common.errors.BrokerIdNotRegisteredException;
+import org.apache.kafka.common.errors.InvalidRequestException;
 import org.apache.kafka.common.errors.NotControllerException;
 import org.apache.kafka.common.errors.UnknownServerException;
 import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
 import org.apache.kafka.common.message.AllocateProducerIdsRequestData;
 import org.apache.kafka.common.message.AllocateProducerIdsResponseData;
-import org.apache.kafka.common.message.AlterIsrRequestData;
-import org.apache.kafka.common.message.AlterIsrResponseData;
+import org.apache.kafka.common.message.AlterPartitionRequestData;
+import org.apache.kafka.common.message.AlterPartitionResponseData;
 import org.apache.kafka.common.message.AlterPartitionReassignmentsRequestData;
 import org.apache.kafka.common.message.AlterPartitionReassignmentsResponseData;
 import org.apache.kafka.common.message.BrokerHeartbeatRequestData;
@@ -42,6 +44,7 @@ import org.apache.kafka.common.message.ElectLeadersRequestData;
 import org.apache.kafka.common.message.ElectLeadersResponseData;
 import org.apache.kafka.common.message.ListPartitionReassignmentsRequestData;
 import org.apache.kafka.common.message.ListPartitionReassignmentsResponseData;
+import org.apache.kafka.common.metadata.AccessControlEntryRecord;
 import org.apache.kafka.common.metadata.ConfigRecord;
 import org.apache.kafka.common.metadata.ClientQuotaRecord;
 import org.apache.kafka.common.metadata.FeatureLevelRecord;
@@ -51,6 +54,7 @@ import org.apache.kafka.common.metadata.PartitionChangeRecord;
 import org.apache.kafka.common.metadata.PartitionRecord;
 import org.apache.kafka.common.metadata.ProducerIdsRecord;
 import org.apache.kafka.common.metadata.RegisterBrokerRecord;
+import org.apache.kafka.common.metadata.RemoveAccessControlEntryRecord;
 import org.apache.kafka.common.metadata.RemoveTopicRecord;
 import org.apache.kafka.common.metadata.TopicRecord;
 import org.apache.kafka.common.metadata.UnfenceBrokerRecord;
@@ -63,6 +67,10 @@ import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.controller.SnapshotGenerator.Section;
+import org.apache.kafka.metadata.KafkaConfigSchema;
+import org.apache.kafka.metadata.authorizer.ClusterMetadataAuthorizer;
+import org.apache.kafka.server.authorizer.AclCreateResult;
+import org.apache.kafka.server.authorizer.AclDeleteResult;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.metadata.BrokerHeartbeatReply;
 import org.apache.kafka.metadata.BrokerRegistrationReply;
@@ -93,6 +101,7 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.RejectedExecutionException;
@@ -128,24 +137,30 @@ public final class QuorumController implements Controller {
      */
     static public class Builder {
         private final int nodeId;
+        private final String clusterId;
         private Time time = Time.SYSTEM;
         private String threadNamePrefix = null;
         private LogContext logContext = null;
-        private Map<ConfigResource.Type, ConfigDef> configDefs = Collections.emptyMap();
+        private KafkaConfigSchema configSchema = KafkaConfigSchema.EMPTY;
         private RaftClient<ApiMessageAndVersion> raftClient = null;
         private Map<String, VersionRange> supportedFeatures = Collections.emptyMap();
         private short defaultReplicationFactor = 3;
         private int defaultNumPartitions = 1;
+        private boolean isLeaderRecoverySupported = false;
         private ReplicaPlacer replicaPlacer = new StripedReplicaPlacer(new Random());
         private long snapshotMaxNewRecordBytes = Long.MAX_VALUE;
+        private OptionalLong leaderImbalanceCheckIntervalNs = OptionalLong.empty();
         private long sessionTimeoutNs = NANOSECONDS.convert(18, TimeUnit.SECONDS);
         private ControllerMetrics controllerMetrics = null;
         private Optional<CreateTopicPolicy> createTopicPolicy = Optional.empty();
         private Optional<AlterConfigPolicy> alterConfigPolicy = Optional.empty();
         private ConfigurationValidator configurationValidator = ConfigurationValidator.NO_OP;
+        private Optional<ClusterMetadataAuthorizer> authorizer = Optional.empty();
+        private Map<String, Object> staticConfig = Collections.emptyMap();
 
-        public Builder(int nodeId) {
+        public Builder(int nodeId, String clusterId) {
             this.nodeId = nodeId;
+            this.clusterId = clusterId;
         }
 
         public Builder setTime(Time time) {
@@ -163,8 +178,8 @@ public final class QuorumController implements Controller {
             return this;
         }
 
-        public Builder setConfigDefs(Map<ConfigResource.Type, ConfigDef> configDefs) {
-            this.configDefs = configDefs;
+        public Builder setConfigSchema(KafkaConfigSchema configSchema) {
+            this.configSchema = configSchema;
             return this;
         }
 
@@ -188,6 +203,11 @@ public final class QuorumController implements Controller {
             return this;
         }
 
+        public Builder setIsLeaderRecoverySupported(boolean isLeaderRecoverySupported) {
+            this.isLeaderRecoverySupported = isLeaderRecoverySupported;
+            return this;
+        }
+
         public Builder setReplicaPlacer(ReplicaPlacer replicaPlacer) {
             this.replicaPlacer = replicaPlacer;
             return this;
@@ -195,6 +215,11 @@ public final class QuorumController implements Controller {
 
         public Builder setSnapshotMaxNewRecordBytes(long value) {
             this.snapshotMaxNewRecordBytes = value;
+            return this;
+        }
+
+        public Builder setLeaderImbalanceCheckIntervalNs(OptionalLong value) {
+            this.leaderImbalanceCheckIntervalNs = value;
             return this;
         }
 
@@ -223,6 +248,16 @@ public final class QuorumController implements Controller {
             return this;
         }
 
+        public Builder setAuthorizer(ClusterMetadataAuthorizer authorizer) {
+            this.authorizer = Optional.of(authorizer);
+            return this;
+        }
+
+        public Builder setStaticConfig(Map<String, Object> staticConfig) {
+            this.staticConfig = staticConfig;
+            return this;
+        }
+
         @SuppressWarnings("unchecked")
         public QuorumController build() throws Exception {
             if (raftClient == null) {
@@ -241,11 +276,12 @@ public final class QuorumController implements Controller {
             KafkaEventQueue queue = null;
             try {
                 queue = new KafkaEventQueue(time, logContext, threadNamePrefix + "QuorumController");
-                return new QuorumController(logContext, nodeId, queue, time, configDefs,
-                    raftClient, supportedFeatures, defaultReplicationFactor,
-                    defaultNumPartitions, replicaPlacer, snapshotMaxNewRecordBytes,
-                    sessionTimeoutNs, controllerMetrics, createTopicPolicy,
-                    alterConfigPolicy, configurationValidator);
+                return new QuorumController(logContext, nodeId, clusterId, queue, time,
+                    configSchema, raftClient, supportedFeatures, defaultReplicationFactor,
+                    defaultNumPartitions, isLeaderRecoverySupported, replicaPlacer, snapshotMaxNewRecordBytes,
+                    leaderImbalanceCheckIntervalNs, sessionTimeoutNs, controllerMetrics,
+                    createTopicPolicy, alterConfigPolicy, configurationValidator, authorizer,
+                    staticConfig);
             } catch (Exception e) {
                 Utils.closeQuietly(queue, "event queue");
                 throw e;
@@ -265,11 +301,16 @@ public final class QuorumController implements Controller {
                 case BROKER_LOGGER:
                     break;
                 case BROKER:
+                    // Cluster configs are always allowed.
+                    if (configResource.name().isEmpty()) break;
+
+                    // Otherwise, check that the broker ID is valid.
                     int brokerId;
                     try {
                         brokerId = Integer.parseInt(configResource.name());
                     } catch (NumberFormatException e) {
-                        brokerId = -1;
+                        throw new InvalidRequestException("Invalid broker name " +
+                            configResource.name());
                     }
                     if (!clusterControl.brokerRegistrations().containsKey(brokerId)) {
                         throw new BrokerIdNotRegisteredException("No broker with id " +
@@ -324,7 +365,7 @@ public final class QuorumController implements Controller {
                                            OptionalLong startProcessingTimeNs,
                                            Throwable exception) {
         if (!startProcessingTimeNs.isPresent()) {
-            log.info("unable to start processing {} because of {}.", name,
+            log.error("{}: unable to start processing because of {}.", name,
                 exception.getClass().getSimpleName());
             if (exception instanceof ApiException) {
                 return exception;
@@ -342,7 +383,7 @@ public final class QuorumController implements Controller {
         }
         log.warn("{}: failed with unknown server exception {} at epoch {} in {} us.  " +
             "Reverting to last committed offset {}.",
-            this, exception.getClass().getSimpleName(), curClaimEpoch, deltaUs,
+            name, exception.getClass().getSimpleName(), curClaimEpoch, deltaUs,
             lastCommittedOffset, exception);
         raftClient.resign(curClaimEpoch);
         renounce();
@@ -424,7 +465,8 @@ public final class QuorumController implements Controller {
                         new Section("replication", replicationControl.iterator(committedOffset)),
                         new Section("configuration", configurationControl.iterator(committedOffset)),
                         new Section("clientQuotas", clientQuotaControlManager.iterator(committedOffset)),
-                        new Section("producerIds", producerIdControlManager.iterator(committedOffset))
+                        new Section("producerIds", producerIdControlManager.iterator(committedOffset)),
+                        new Section("acls", aclControlManager.iterator(committedOffset))
                     )
                 );
                 reschedule(0);
@@ -621,18 +663,18 @@ public final class QuorumController implements Controller {
                 OptionalLong maybeOffset = purgatory.highestPendingOffset();
                 if (!maybeOffset.isPresent()) {
                     // If the purgatory is empty, there are no pending operations and no
-                    // uncommitted state.  We can return immediately.
+                    // uncommitted state.  We can complete immediately.
                     resultAndOffset = ControllerResultAndOffset.of(-1, result);
                     log.debug("Completing read-only operation {} immediately because " +
                         "the purgatory is empty.", this);
                     complete(null);
-                    return;
+                } else {
+                    // If there are operations in the purgatory, we want to wait for the latest
+                    // one to complete before returning our result to the user.
+                    resultAndOffset = ControllerResultAndOffset.of(maybeOffset.getAsLong(), result);
+                    log.debug("Read-only operation {} will be completed when the log " +
+                        "reaches offset {}", this, resultAndOffset.offset());
                 }
-                // If there are operations in the purgatory, we want to wait for the latest
-                // one to complete before returning our result to the user.
-                resultAndOffset = ControllerResultAndOffset.of(maybeOffset.getAsLong(), result);
-                log.debug("Read-only operation {} will be completed when the log " +
-                    "reaches offset {}", this, resultAndOffset.offset());
             } else {
                 // If the operation returned a batch of records, those records need to be
                 // written before we can return our result to the user.  Here, we hand off
@@ -651,10 +693,19 @@ public final class QuorumController implements Controller {
                     replay(message.message(), Optional.empty(), offset);
                 }
                 snapshotRegistry.getOrCreateSnapshot(offset);
+
                 log.debug("Read-write operation {} will be completed when the log " +
                     "reaches offset {}.", this, resultAndOffset.offset());
             }
-            purgatory.add(resultAndOffset.offset(), this);
+
+            // After every controller write event, schedule a leader rebalance if there are any topic partition
+            // with leader that is not the preferred leader.
+            maybeScheduleNextBalancePartitionLeaders();
+
+            // Remember the latest offset and future if it is not already completed
+            if (!future.isDone()) {
+                purgatory.add(resultAndOffset.offset(), this);
+            }
         }
 
         @Override
@@ -721,7 +772,6 @@ public final class QuorumController implements Controller {
                             // otherwise, we should delete up to the current committed offset.
                             snapshotRegistry.deleteSnapshotsUpTo(
                                 snapshotGeneratorManager.snapshotLastOffsetFromLog().orElse(offset));
-
                         } else {
                             // If the controller is a standby, replay the records that were
                             // created by the active controller.
@@ -807,6 +857,7 @@ public final class QuorumController implements Controller {
                     lastCommittedEpoch = reader.lastContainedLogEpoch();
                     lastCommittedTimestamp = reader.lastContainedLogTimestamp();
                     snapshotRegistry.getOrCreateSnapshot(lastCommittedOffset);
+                    authorizer.ifPresent(a -> a.loadSnapshot(aclControlManager.idToAcl()));
                 } finally {
                     reader.close();
                 }
@@ -838,6 +889,10 @@ public final class QuorumController implements Controller {
                     // required because the active controller assumes that there is always an in-memory snapshot at the
                     // last committed offset.
                     snapshotRegistry.getOrCreateSnapshot(lastCommittedOffset);
+
+                    // When becoming the active controller, schedule a leader rebalance if there are any topic partition
+                    // with leader that is not the preferred leader.
+                    maybeScheduleNextBalancePartitionLeaders();
                 });
             } else if (curClaimEpoch != -1) {
                 appendRaftEvent("handleRenounce[" + curClaimEpoch + "]", () -> {
@@ -871,7 +926,9 @@ public final class QuorumController implements Controller {
         purgatory.failAll(newNotControllerException());
 
         if (snapshotRegistry.hasSnapshot(lastCommittedOffset)) {
+            newBytesSinceLastSnapshot = 0;
             snapshotRegistry.revertToSnapshot(lastCommittedOffset);
+            authorizer.ifPresent(a -> a.loadSnapshot(aclControlManager.idToAcl()));
         } else {
             resetState();
             raftClient.unregister(metaLogListener);
@@ -882,6 +939,7 @@ public final class QuorumController implements Controller {
         writeOffset = -1;
         clusterControl.deactivate();
         cancelMaybeFenceReplicas();
+        cancelMaybeBalancePartitionLeaders();
     }
 
     private <T> void scheduleDeferredWriteEvent(String name, long deadlineNs,
@@ -928,6 +986,62 @@ public final class QuorumController implements Controller {
         queue.cancelDeferred(MAYBE_FENCE_REPLICAS);
     }
 
+    private static final String MAYBE_BALANCE_PARTITION_LEADERS = "maybeBalancePartitionLeaders";
+
+    private static final int MAX_ELECTIONS_PER_IMBALANCE = 1_000;
+
+    private void maybeScheduleNextBalancePartitionLeaders() {
+        if (imbalancedScheduled != ImbalanceSchedule.SCHEDULED &&
+            leaderImbalanceCheckIntervalNs.isPresent() &&
+            replicationControl.arePartitionLeadersImbalanced()) {
+
+            log.debug(
+                "Scheduling write event for {} because scheduled ({}), checkIntervalNs ({}) and isImbalanced ({})",
+                MAYBE_BALANCE_PARTITION_LEADERS,
+                imbalancedScheduled,
+                leaderImbalanceCheckIntervalNs,
+                replicationControl.arePartitionLeadersImbalanced()
+            );
+
+            ControllerWriteEvent<Boolean> event = new ControllerWriteEvent<>(MAYBE_BALANCE_PARTITION_LEADERS, () -> {
+                ControllerResult<Boolean> result = replicationControl.maybeBalancePartitionLeaders();
+
+                // reschedule the operation after the leaderImbalanceCheckIntervalNs interval.
+                // Mark the imbalance event as completed and reschedule if necessary
+                if (result.response()) {
+                    imbalancedScheduled = ImbalanceSchedule.IMMEDIATELY;
+                } else {
+                    imbalancedScheduled = ImbalanceSchedule.DEFERRED;
+                }
+
+                // Note that rescheduling this event here is not required because MAYBE_BALANCE_PARTITION_LEADERS
+                // is a ControllerWriteEvent. ControllerWriteEvent always calls this method after the records
+                // generated by a ControllerWriteEvent have been applied.
+
+                return result;
+            });
+
+            long delayNs = time.nanoseconds();
+            if (imbalancedScheduled == ImbalanceSchedule.DEFERRED) {
+                delayNs += leaderImbalanceCheckIntervalNs.getAsLong();
+            } else {
+                // The current implementation of KafkaEventQueue always picks from the deferred collection of operations
+                // before picking from the non-deferred collection of operations. This can result in some unfairness if
+                // deferred operation are scheduled for immediate execution. This delays them by a small amount of time.
+                delayNs += NANOSECONDS.convert(10, TimeUnit.MILLISECONDS);
+            }
+
+            queue.scheduleDeferred(MAYBE_BALANCE_PARTITION_LEADERS, new EarliestDeadlineFunction(delayNs), event);
+
+            imbalancedScheduled = ImbalanceSchedule.SCHEDULED;
+        }
+    }
+
+    private void cancelMaybeBalancePartitionLeaders() {
+        imbalancedScheduled = ImbalanceSchedule.DEFERRED;
+        queue.cancelDeferred(MAYBE_BALANCE_PARTITION_LEADERS);
+    }
+
     @SuppressWarnings("unchecked")
     private void replay(ApiMessage message, Optional<OffsetAndEpoch> snapshotId, long offset) {
         try {
@@ -969,6 +1083,12 @@ public final class QuorumController implements Controller {
                 case PRODUCER_IDS_RECORD:
                     producerIdControlManager.replay((ProducerIdsRecord) message);
                     break;
+                case ACCESS_CONTROL_ENTRY_RECORD:
+                    aclControlManager.replay((AccessControlEntryRecord) message, snapshotId);
+                    break;
+                case REMOVE_ACCESS_CONTROL_ENTRY_RECORD:
+                    aclControlManager.replay((RemoveAccessControlEntryRecord) message, snapshotId);
+                    break;
                 default:
                     throw new RuntimeException("Unhandled record type " + type);
             }
@@ -1004,6 +1124,9 @@ public final class QuorumController implements Controller {
         }
     }
 
+    /**
+     * Clear all data structures and reset all KRaft state.
+     */
     private void resetState() {
         snapshotGeneratorManager.cancel();
         snapshotRegistry.reset();
@@ -1022,6 +1145,11 @@ public final class QuorumController implements Controller {
      * The ID of this controller node.
      */
     private final int nodeId;
+
+    /**
+     * The ID of this cluster.
+     */
+    private final String clusterId;
 
     /**
      * The single-threaded queue that processes all of our events.
@@ -1092,6 +1220,18 @@ public final class QuorumController implements Controller {
     private final ReplicationControlManager replicationControl;
 
     /**
+     * The ClusterMetadataAuthorizer, if one is configured. Note that this will still be
+     * Optional.empty() if an Authorizer is configured that doesn't use __cluster_metadata.
+     */
+    private final Optional<ClusterMetadataAuthorizer> authorizer;
+
+    /**
+     * Manages the standard ACLs in the cluster.
+     * This must be accessed only by the event queue thread.
+     */
+    private final AclControlManager aclControlManager;
+
+    /**
      * Manages generating controller snapshots.
      */
     private final SnapshotGeneratorManager snapshotGeneratorManager = new SnapshotGeneratorManager();
@@ -1146,42 +1286,79 @@ public final class QuorumController implements Controller {
      */
     private long newBytesSinceLastSnapshot = 0;
 
+    /**
+     * How long to delay partition leader balancing operations.
+     */
+    private final OptionalLong leaderImbalanceCheckIntervalNs;
+
+    private enum ImbalanceSchedule {
+        // The leader balancing operation has been scheduled
+        SCHEDULED,
+        // If the leader balancing operation should be scheduled, schedule it with a delay
+        DEFERRED,
+        // If the leader balancing operation should be scheduled, schedule it immediately
+        IMMEDIATELY
+    }
+
+    /**
+     * Tracks the scheduling state for partition leader balancing operations.
+     */
+    private ImbalanceSchedule imbalancedScheduled = ImbalanceSchedule.DEFERRED;
+
     private QuorumController(LogContext logContext,
                              int nodeId,
+                             String clusterId,
                              KafkaEventQueue queue,
                              Time time,
-                             Map<ConfigResource.Type, ConfigDef> configDefs,
+                             KafkaConfigSchema configSchema,
                              RaftClient<ApiMessageAndVersion> raftClient,
                              Map<String, VersionRange> supportedFeatures,
                              short defaultReplicationFactor,
                              int defaultNumPartitions,
+                             boolean isLeaderRecoverySupported,
                              ReplicaPlacer replicaPlacer,
                              long snapshotMaxNewRecordBytes,
+                             OptionalLong leaderImbalanceCheckIntervalNs,
                              long sessionTimeoutNs,
                              ControllerMetrics controllerMetrics,
                              Optional<CreateTopicPolicy> createTopicPolicy,
                              Optional<AlterConfigPolicy> alterConfigPolicy,
-                             ConfigurationValidator configurationValidator) {
+                             ConfigurationValidator configurationValidator,
+                             Optional<ClusterMetadataAuthorizer> authorizer,
+                             Map<String, Object> staticConfig) {
         this.logContext = logContext;
         this.log = logContext.logger(QuorumController.class);
         this.nodeId = nodeId;
+        this.clusterId = clusterId;
         this.queue = queue;
         this.time = time;
         this.controllerMetrics = controllerMetrics;
         this.snapshotRegistry = new SnapshotRegistry(logContext);
         this.purgatory = new ControllerPurgatory();
         this.resourceExists = new ConfigResourceExistenceChecker();
-        this.configurationControl = new ConfigurationControlManager(logContext,
-            snapshotRegistry, configDefs, alterConfigPolicy, configurationValidator);
+        this.configurationControl = new ConfigurationControlManager.Builder().
+            setLogContext(logContext).
+            setSnapshotRegistry(snapshotRegistry).
+            setKafkaConfigSchema(configSchema).
+            setExistenceChecker(resourceExists).
+            setAlterConfigPolicy(alterConfigPolicy).
+            setValidator(configurationValidator).
+            setStaticConfig(staticConfig).
+            setNodeId(nodeId).
+            build();
         this.clientQuotaControlManager = new ClientQuotaControlManager(snapshotRegistry);
-        this.clusterControl = new ClusterControlManager(logContext, time,
+        this.clusterControl = new ClusterControlManager(logContext, clusterId, time,
             snapshotRegistry, sessionTimeoutNs, replicaPlacer, controllerMetrics);
         this.featureControl = new FeatureControlManager(supportedFeatures, snapshotRegistry);
         this.producerIdControlManager = new ProducerIdControlManager(clusterControl, snapshotRegistry);
         this.snapshotMaxNewRecordBytes = snapshotMaxNewRecordBytes;
+        this.leaderImbalanceCheckIntervalNs = leaderImbalanceCheckIntervalNs;
         this.replicationControl = new ReplicationControlManager(snapshotRegistry,
-            logContext, defaultReplicationFactor, defaultNumPartitions,
-            configurationControl, clusterControl, controllerMetrics, createTopicPolicy);
+            logContext, defaultReplicationFactor, defaultNumPartitions, MAX_ELECTIONS_PER_IMBALANCE,
+            isLeaderRecoverySupported, configurationControl, clusterControl, controllerMetrics, createTopicPolicy);
+        this.authorizer = authorizer;
+        authorizer.ifPresent(a -> a.setAclMutator(this));
+        this.aclControlManager = new AclControlManager(snapshotRegistry, authorizer);
         this.raftClient = raftClient;
         this.metaLogListener = new QuorumMetaLogListener();
         this.curClaimEpoch = -1;
@@ -1193,23 +1370,23 @@ public final class QuorumController implements Controller {
     }
 
     @Override
-    public CompletableFuture<AlterIsrResponseData> alterIsr(AlterIsrRequestData request) {
+    public CompletableFuture<AlterPartitionResponseData> alterPartition(AlterPartitionRequestData request) {
         if (request.topics().isEmpty()) {
-            return CompletableFuture.completedFuture(new AlterIsrResponseData());
+            return CompletableFuture.completedFuture(new AlterPartitionResponseData());
         }
-        return appendWriteEvent("alterIsr", () ->
-            replicationControl.alterIsr(request));
+        return appendWriteEvent("alterPartition", () ->
+            replicationControl.alterPartition(request));
     }
 
     @Override
     public CompletableFuture<CreateTopicsResponseData>
-            createTopics(CreateTopicsRequestData request) {
+            createTopics(CreateTopicsRequestData request, Set<String> describable) {
         if (request.topics().isEmpty()) {
             return CompletableFuture.completedFuture(new CreateTopicsResponseData());
         }
         return appendWriteEvent("createTopics",
             time.nanoseconds() + NANOSECONDS.convert(request.timeoutMs(), MILLISECONDS),
-            () -> replicationControl.createTopics(request));
+            () -> replicationControl.createTopics(request, describable));
     }
 
     @Override
@@ -1224,6 +1401,12 @@ public final class QuorumController implements Controller {
         if (names.isEmpty()) return CompletableFuture.completedFuture(Collections.emptyMap());
         return appendReadEvent("findTopicIds", deadlineNs,
             () -> replicationControl.findTopicIds(lastCommittedOffset, names));
+    }
+
+    @Override
+    public CompletableFuture<Map<String, Uuid>> findAllTopicIds(long deadlineNs) {
+        return appendReadEvent("findAllTopicIds", deadlineNs,
+            () -> replicationControl.findAllTopicIds(lastCommittedOffset));
     }
 
     @Override
@@ -1277,7 +1460,7 @@ public final class QuorumController implements Controller {
         }
         return appendWriteEvent("incrementalAlterConfigs", () -> {
             ControllerResult<Map<ConfigResource, ApiError>> result =
-                configurationControl.incrementalAlterConfigs(configChanges, resourceExists);
+                configurationControl.incrementalAlterConfigs(configChanges, false);
             if (validateOnly) {
                 return result.withoutRecords();
             } else {
@@ -1317,7 +1500,7 @@ public final class QuorumController implements Controller {
         }
         return appendWriteEvent("legacyAlterConfigs", () -> {
             ControllerResult<Map<ConfigResource, ApiError>> result =
-                configurationControl.legacyAlterConfigs(newConfigs, resourceExists);
+                configurationControl.legacyAlterConfigs(newConfigs, false);
             if (validateOnly) {
                 return result.withoutRecords();
             } else {
@@ -1388,8 +1571,8 @@ public final class QuorumController implements Controller {
         return appendWriteEvent("allocateProducerIds",
             () -> producerIdControlManager.generateNextProducerId(request.brokerId(), request.brokerEpoch()))
             .thenApply(result -> new AllocateProducerIdsResponseData()
-                    .setProducerIdStart(result.producerIdStart())
-                    .setProducerIdLen(result.producerIdLen()));
+                    .setProducerIdStart(result.firstProducerId())
+                    .setProducerIdLen(result.size()));
     }
 
     @Override
@@ -1419,6 +1602,16 @@ public final class QuorumController implements Controller {
     }
 
     @Override
+    public CompletableFuture<List<AclCreateResult>> createAcls(List<AclBinding> aclBindings) {
+        return appendWriteEvent("createAcls", () -> aclControlManager.createAcls(aclBindings));
+    }
+
+    @Override
+    public CompletableFuture<List<AclDeleteResult>> deleteAcls(List<AclBindingFilter> filters) {
+        return appendWriteEvent("deleteAcls", () -> aclControlManager.deleteAcls(filters));
+    }
+
+    @Override
     public CompletableFuture<Void> waitForReadyBrokers(int minBrokers) {
         final CompletableFuture<Void> future = new CompletableFuture<>();
         appendControlEvent("waitForReadyBrokers", () -> {
@@ -1434,6 +1627,10 @@ public final class QuorumController implements Controller {
 
     public int nodeId() {
         return nodeId;
+    }
+
+    public String clusterId() {
+        return clusterId;
     }
 
     @Override
