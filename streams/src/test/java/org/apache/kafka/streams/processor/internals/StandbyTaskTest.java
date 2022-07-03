@@ -36,7 +36,7 @@ import org.apache.kafka.streams.errors.StreamsException;
 import org.apache.kafka.streams.processor.TaskId;
 import org.apache.kafka.streams.processor.internals.Task.TaskType;
 import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
-import org.apache.kafka.streams.processor.internals.namedtopology.TopologyConfig;
+import org.apache.kafka.streams.TopologyConfig;
 import org.apache.kafka.streams.state.internals.ThreadCache;
 import org.apache.kafka.test.MockKeyValueStore;
 import org.apache.kafka.test.MockKeyValueStoreBuilder;
@@ -108,7 +108,6 @@ public class StandbyTaskTest {
         return new StreamsConfig(mkProperties(mkMap(
             mkEntry(StreamsConfig.APPLICATION_ID_CONFIG, applicationId),
             mkEntry(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:2171"),
-            mkEntry(StreamsConfig.BUFFERED_RECORDS_PER_PARTITION_CONFIG, "3"),
             mkEntry(StreamsConfig.STATE_DIR_CONFIG, baseDir.getCanonicalPath()),
             mkEntry(StreamsConfig.DEFAULT_TIMESTAMP_EXTRACTOR_CLASS_CONFIG, MockTimestampExtractor.class.getName())
         )));
@@ -205,6 +204,47 @@ public class StandbyTaskTest {
         task.closeClean();
 
         assertThrows(IllegalStateException.class, task::prepareCommit);
+    }
+
+
+    @Test
+    public void shouldAlwaysCheckpointStateIfEnforced() {
+        stateManager.flush();
+        EasyMock.expectLastCall().once();
+        stateManager.checkpoint();
+        EasyMock.expectLastCall().once();
+        EasyMock.expect(stateManager.changelogOffsets()).andReturn(Collections.emptyMap()).anyTimes();
+        EasyMock.replay(stateManager);
+
+        task = createStandbyTask();
+
+        task.initializeIfNeeded();
+        task.maybeCheckpoint(true);
+
+        EasyMock.verify(stateManager);
+    }
+
+    @Test
+    public void shouldOnlyCheckpointStateWithBigAdvanceIfNotEnforced() {
+        EasyMock.expect(stateManager.changelogOffsets()).andStubReturn(Collections.emptyMap());
+        stateManager.flush();
+        EasyMock.expectLastCall();
+        stateManager.checkpoint();
+        EasyMock.expectLastCall().once();
+        EasyMock.expect(stateManager.changelogOffsets())
+                .andReturn(Collections.singletonMap(partition, 50L))
+                .andReturn(Collections.singletonMap(partition, 11000L))
+                .andReturn(Collections.singletonMap(partition, 11000L));
+        EasyMock.replay(stateManager);
+
+        task = createStandbyTask();
+        task.initializeIfNeeded();
+
+        task.maybeCheckpoint(false);  // this should not checkpoint
+        task.maybeCheckpoint(false);  // this should checkpoint
+        task.maybeCheckpoint(false);  // this should not checkpoint
+
+        EasyMock.verify(stateManager);
     }
 
     @Test
