@@ -594,7 +594,7 @@ public class StreamThread extends Thread {
                 runOnce();
                 if (nextProbingRebalanceMs.get() < time.milliseconds()) {
                     log.info("Triggering the followup rebalance scheduled for {} ms.", nextProbingRebalanceMs.get());
-                    mainConsumer.enforceRebalance();
+                    mainConsumer.enforceRebalance("Scheduled probing rebalance");
                     nextProbingRebalanceMs.set(Long.MAX_VALUE);
                 }
             } catch (final TaskCorruptedException e) {
@@ -606,7 +606,7 @@ public class StreamThread extends Thread {
                     final boolean enforceRebalance = taskManager.handleCorruption(e.corruptedTasks());
                     if (enforceRebalance && eosEnabled) {
                         log.info("Active task(s) got corrupted. Triggering a rebalance.");
-                        mainConsumer.enforceRebalance();
+                        mainConsumer.enforceRebalance("Active tasks corrupted");
                     }
                 } catch (final TaskMigratedException taskMigrated) {
                     handleTaskMigrated(taskMigrated);
@@ -648,7 +648,7 @@ public class StreamThread extends Thread {
         if (assignmentErrorCode.get() == AssignorError.SHUTDOWN_REQUESTED.code()) {
             log.warn("Detected that shutdown was requested. " +
                     "All clients in this app will now begin to shutdown");
-            mainConsumer.enforceRebalance();
+            mainConsumer.enforceRebalance("Shutdown requested");
         }
     }
 
@@ -818,10 +818,10 @@ public class StreamThread extends Thread {
 
                 final long beforeCommitMs = now;
                 final int committed = maybeCommit();
-                totalCommittedSinceLastSummary += committed;
                 final long commitLatency = Math.max(now - beforeCommitMs, 0);
                 totalCommitLatency += commitLatency;
                 if (committed > 0) {
+                    totalCommittedSinceLastSummary += committed;
                     commitSensor.record(commitLatency / (double) committed, now);
 
                     if (log.isDebugEnabled()) {
@@ -897,7 +897,8 @@ public class StreamThread extends Thread {
         }
         // we can always let changelog reader try restoring in order to initialize the changelogs;
         // if there's no active restoring or standby updating it would not try to fetch any data
-        changelogReader.restore(taskManager.tasks());
+        // After KAFKA-13873, we only restore the not paused tasks.
+        changelogReader.restore(taskManager.notPausedTasks());
         log.debug("Idempotent restore call done. Thread state has not changed.");
     }
 

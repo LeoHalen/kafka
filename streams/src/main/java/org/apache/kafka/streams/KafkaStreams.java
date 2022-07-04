@@ -56,7 +56,6 @@ import org.apache.kafka.streams.processor.TaskId;
 import org.apache.kafka.streams.processor.internals.ClientUtils;
 import org.apache.kafka.streams.processor.internals.DefaultKafkaClientSupplier;
 import org.apache.kafka.streams.processor.internals.GlobalStreamThread;
-import org.apache.kafka.streams.processor.internals.GlobalStreamThread.State;
 import org.apache.kafka.streams.processor.internals.StateDirectory;
 import org.apache.kafka.streams.processor.internals.StreamThread;
 import org.apache.kafka.streams.processor.internals.StreamsMetadataState;
@@ -65,6 +64,7 @@ import org.apache.kafka.streams.processor.internals.ThreadStateTransitionValidat
 import org.apache.kafka.streams.processor.internals.TopologyMetadata;
 import org.apache.kafka.streams.processor.internals.assignment.AssignorError;
 import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
+import org.apache.kafka.streams.processor.internals.namedtopology.NamedTopology;
 import org.apache.kafka.streams.query.FailureReason;
 import org.apache.kafka.streams.query.PositionBound;
 import org.apache.kafka.streams.query.QueryConfig;
@@ -111,6 +111,7 @@ import static org.apache.kafka.streams.internals.ApiUtils.prepareMillisCheckFail
 import static org.apache.kafka.streams.internals.ApiUtils.validateMillisecondDuration;
 import static org.apache.kafka.streams.internals.StreamsConfigUtils.getTotalCacheSize;
 import static org.apache.kafka.streams.processor.internals.ClientUtils.fetchEndOffsets;
+import static org.apache.kafka.streams.processor.internals.TopologyMetadata.UNNAMED_TOPOLOGY;
 
 /**
  * A Kafka client that allows for performing continuous computation on input coming from one or more input topics and
@@ -1350,6 +1351,24 @@ public class KafkaStreams implements AutoCloseable {
     }
 
     /**
+     * Class that handles options passed in case of {@code KafkaStreams} instance scale down
+     */
+    public static class CloseOptions {
+        private Duration timeout = Duration.ofMillis(Long.MAX_VALUE);
+        private boolean leaveGroup = false;
+
+        public CloseOptions timeout(final Duration timeout) {
+            this.timeout = timeout;
+            return this;
+        }
+
+        public CloseOptions leaveGroup(final boolean leaveGroup) {
+            this.leaveGroup = leaveGroup;
+            return this;
+        }
+    }
+
+    /**
      * Shutdown this {@code KafkaStreams} instance by signaling all the threads to stop, and then wait for them to join.
      * This will block until all threads have stopped.
      */
@@ -1496,6 +1515,61 @@ public class KafkaStreams implements AutoCloseable {
         log.debug("Stopping Streams client with timeoutMillis = {} ms.", timeoutMs);
 
         return close(timeoutMs);
+    }
+
+    /**
+     * Shutdown this {@code KafkaStreams} by signaling all the threads to stop, and then wait up to the timeout for the
+     * threads to join.
+     * @param options  contains timeout to specify how long to wait for the threads to shutdown, and a flag leaveGroup to
+     *                 trigger consumer leave call
+     * @return {@code true} if all threads were successfully stopped&mdash;{@code false} if the timeout was reached
+     * before all threads stopped
+     * Note that this method must not be called in the {@link StateListener#onChange(KafkaStreams.State, KafkaStreams.State)} callback of {@link StateListener}.
+     * @throws IllegalArgumentException if {@code timeout} can't be represented as {@code long milliseconds}
+     */
+    public synchronized boolean close(final CloseOptions options) throws IllegalArgumentException {
+        final String msgPrefix = prepareMillisCheckFailMsgPrefix(options.timeout, "timeout");
+        final long timeoutMs = validateMillisecondDuration(options.timeout, msgPrefix);
+        if (timeoutMs < 0) {
+            throw new IllegalArgumentException("Timeout can't be negative.");
+        }
+
+        final long startMs = time.milliseconds();
+
+        final boolean closeStatus = close(timeoutMs);
+
+        final Optional<String> groupInstanceId = clientSupplier
+                .getConsumer(applicationConfigs.getGlobalConsumerConfigs(clientId))
+                .groupMetadata()
+                .groupInstanceId();
+
+        final long remainingTimeMs = Math.max(0, timeoutMs - (time.milliseconds() - startMs));
+
+        if (options.leaveGroup && groupInstanceId.isPresent()) {
+            log.debug("Sending leave group trigger to removing instance from consumer group");
+            //removing instance from consumer group
+
+            final MemberToRemove memberToRemove = new MemberToRemove(groupInstanceId.get());
+
+            final Collection<MemberToRemove> membersToRemove = Collections.singletonList(memberToRemove);
+
+            final RemoveMembersFromConsumerGroupResult removeMembersFromConsumerGroupResult = adminClient
+                    .removeMembersFromConsumerGroup(
+                        applicationConfigs.getString(StreamsConfig.APPLICATION_ID_CONFIG),
+                        new RemoveMembersFromConsumerGroupOptions(membersToRemove)
+                    );
+
+            try {
+                removeMembersFromConsumerGroupResult.memberResult(memberToRemove).get(remainingTimeMs, TimeUnit.MILLISECONDS);
+            } catch (final Exception e) {
+                log.error("Could not remove static member {} from consumer group {} due to a: {}", groupInstanceId.get(),
+                        applicationConfigs.getString(StreamsConfig.APPLICATION_ID_CONFIG), e);
+            }
+        }
+
+        log.debug("Stopping Streams client with timeoutMillis = {} ms.", timeoutMs);
+
+        return closeStatus;
     }
 
     /**
@@ -1660,6 +1734,51 @@ public class KafkaStreams implements AutoCloseable {
             );
         }
         return queryableStoreProvider.getStore(storeQueryParameters);
+    }
+
+    /**
+     *  This method pauses processing for the KafkaStreams instance.
+     *
+     *  Paused topologies will only skip over a) processing, b) punctuation, and c) standby tasks.
+     *  Notably, paused topologies will still poll Kafka consumers, and commit offsets.
+     *  This method sets transient state that is not maintained or managed among instances.
+     *  Note that pause() can be called before start() in order to start a KafkaStreams instance
+     *  in a manner where the processing is paused as described, but the consumers are started up.
+     */
+    public void pause() {
+        if (topologyMetadata.hasNamedTopologies()) {
+            for (final NamedTopology namedTopology : topologyMetadata.getAllNamedTopologies()) {
+                topologyMetadata.pauseTopology(namedTopology.name());
+            }
+        } else {
+            topologyMetadata.pauseTopology(UNNAMED_TOPOLOGY);
+        }
+    }
+
+    /**
+     * @return true when the KafkaStreams instance has its processing paused.
+     */
+    public boolean isPaused() {
+        if (topologyMetadata.hasNamedTopologies()) {
+            return topologyMetadata.getAllNamedTopologies().stream()
+                .map(NamedTopology::name)
+                .allMatch(topologyMetadata::isPaused);
+        } else {
+            return topologyMetadata.isPaused(UNNAMED_TOPOLOGY);
+        }
+    }
+
+    /**
+     * This method resumes processing for the KafkaStreams instance.
+     */
+    public void resume() {
+        if (topologyMetadata.hasNamedTopologies()) {
+            for (final NamedTopology namedTopology : topologyMetadata.getAllNamedTopologies()) {
+                topologyMetadata.resumeTopology(namedTopology.name());
+            }
+        } else {
+            topologyMetadata.resumeTopology(UNNAMED_TOPOLOGY);
+        }
     }
 
     /**

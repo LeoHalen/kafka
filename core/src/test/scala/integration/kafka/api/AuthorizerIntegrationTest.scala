@@ -85,9 +85,8 @@ object AuthorizerIntegrationTest {
   class PrincipalBuilder extends DefaultKafkaPrincipalBuilder(null, null) {
     override def build(context: AuthenticationContext): KafkaPrincipal = {
       context.listenerName match {
-        case BrokerListenerName => BrokerPrincipal
+        case BrokerListenerName | ControllerListenerName => BrokerPrincipal
         case ClientListenerName => ClientPrincipal
-        case ControllerListenerName => BrokerPrincipal
         case listenerName => throw new IllegalArgumentException(s"No principal mapped to listener $listenerName")
       }
     }
@@ -152,32 +151,32 @@ class AuthorizerIntegrationTest extends BaseRequestTest {
   consumerConfig.setProperty(ConsumerConfig.GROUP_ID_CONFIG, group)
 
   override def brokerPropertyOverrides(properties: Properties): Unit = {
+    properties.put(KafkaConfig.BrokerIdProp, brokerId.toString)
+    addNodeProperties(properties)
+  }
+
+  override def kraftControllerConfigs(): collection.Seq[Properties] = {
+    val controllerConfigs = super.kraftControllerConfigs()
+    controllerConfigs.foreach(addNodeProperties)
+    controllerConfigs
+  }
+
+  private def addNodeProperties(properties: Properties): Unit = {
     if (isKRaftTest()) {
       properties.put(KafkaConfig.AuthorizerClassNameProp, classOf[StandardAuthorizer].getName)
-      properties.put(StandardAuthorizer.SUPER_USERS_CONFIG, BrokerPrincipal.toString())
+      properties.put(StandardAuthorizer.SUPER_USERS_CONFIG, BrokerPrincipal.toString)
     } else {
       properties.put(KafkaConfig.AuthorizerClassNameProp, classOf[AclAuthorizer].getName)
     }
-    properties.put(KafkaConfig.BrokerIdProp, brokerId.toString)
+
     properties.put(KafkaConfig.OffsetsTopicPartitionsProp, "1")
     properties.put(KafkaConfig.OffsetsTopicReplicationFactorProp, "1")
     properties.put(KafkaConfig.TransactionsTopicPartitionsProp, "1")
     properties.put(KafkaConfig.TransactionsTopicReplicationFactorProp, "1")
     properties.put(KafkaConfig.TransactionsTopicMinISRProp, "1")
-    properties.put(BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG,
-      classOf[PrincipalBuilder].getName)
+    properties.put(BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG, classOf[PrincipalBuilder].getName)
   }
 
-  override def kraftControllerConfigs(): Seq[Properties] = {
-    val controllerConfigs = Seq(new Properties())
-    controllerConfigs.foreach { properties =>
-      properties.put(KafkaConfig.AuthorizerClassNameProp, classOf[StandardAuthorizer].getName())
-      properties.put(StandardAuthorizer.SUPER_USERS_CONFIG, BrokerPrincipal.toString())
-      properties.put(BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG,
-        classOf[PrincipalBuilder].getName)
-    }
-    controllerConfigs
-  }
 
   val requestKeyToError = (topicNames: Map[Uuid, String], version: Short) => Map[ApiKeys, Nothing => Errors](
     ApiKeys.METADATA -> ((resp: requests.MetadataResponse) => resp.errors.asScala.find(_._1 == topic).getOrElse(("test", Errors.NONE))._2),
@@ -549,7 +548,7 @@ class AuthorizerIntegrationTest extends BaseRequestTest {
         .setLeader(brokerId)
         .setLeaderEpoch(Int.MaxValue)
         .setIsr(List(brokerId).asJava)
-        .setZkVersion(2)
+        .setPartitionEpoch(2)
         .setReplicas(Seq(brokerId).asJava)
         .setIsNew(false)).asJava,
       getTopicIds().asJava,
@@ -562,7 +561,7 @@ class AuthorizerIntegrationTest extends BaseRequestTest {
         .setTopicName(tp.topic)
         .setPartitionStates(Seq(new StopReplicaPartitionState()
           .setPartitionIndex(tp.partition)
-          .setLeaderEpoch(LeaderAndIsr.initialLeaderEpoch + 2)
+          .setLeaderEpoch(LeaderAndIsr.InitialLeaderEpoch + 2)
           .setDeletePartition(true)).asJava)
     ).asJava
     new StopReplicaRequest.Builder(ApiKeys.STOP_REPLICA.latestVersion, brokerId, Int.MaxValue,
@@ -2510,13 +2509,14 @@ class AuthorizerIntegrationTest extends BaseRequestTest {
     val aclEntryFilter = new AccessControlEntryFilter(clientPrincipalString, null, AclOperation.ANY, AclPermissionType.ANY)
     val aclFilter = new AclBindingFilter(ResourcePatternFilter.ANY, aclEntryFilter)
 
-    authorizerForWrite.deleteAcls(null, List(aclFilter).asJava).asScala.map(_.toCompletableFuture.get).flatMap { deletion =>
-      deletion.aclBindingDeleteResults().asScala.map(_.aclBinding.pattern).toSet
-    }.foreach { resource =>
-      (brokers.map(_.authorizer.get) ++ controllerServers.map(_.authorizer.get)).foreach { authorizer =>
-        TestUtils.waitAndVerifyAcls(Set.empty[AccessControlEntry], authorizer, resource, aclEntryFilter)
+    authorizerForWrite.deleteAcls(TestUtils.anonymousAuthorizableContext, List(aclFilter).asJava).asScala.
+      map(_.toCompletableFuture.get).flatMap { deletion =>
+        deletion.aclBindingDeleteResults().asScala.map(_.aclBinding.pattern).toSet
+      }.foreach { resource =>
+        (brokers.map(_.authorizer.get) ++ controllerServers.map(_.authorizer.get)).foreach { authorizer =>
+          TestUtils.waitAndVerifyAcls(Set.empty[AccessControlEntry], authorizer, resource, aclEntryFilter)
+        }
       }
-    }
   }
 
   private def sendRequestAndVerifyResponseError(request: AbstractRequest,
@@ -2571,14 +2571,6 @@ class AuthorizerIntegrationTest extends BaseRequestTest {
     } catch {
       case e: ExecutionException => throw e.getCause
     }
-  }
-
-  private def addAndVerifyAcls(acls: Set[AccessControlEntry], resource: ResourcePattern): Unit = {
-    TestUtils.addAndVerifyAcls(brokers, acls, resource, controllerServers)
-  }
-
-  private def removeAndVerifyAcls(acls: Set[AccessControlEntry], resource: ResourcePattern): Unit = {
-    TestUtils.removeAndVerifyAcls(brokers, acls, resource, controllerServers)
   }
 
   private def consumeRecords(consumer: Consumer[Array[Byte], Array[Byte]],
