@@ -488,6 +488,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
     }
 
     /**
+     * note: 轮询协调器事件。这确保了协调者是已知的并且消费者已经加入了组（如果它正在使用组管理）。如果启用，这也会处理定期偏移提交。
      * Poll for coordinator events. This ensures that the coordinator is known and that the consumer
      * has joined the group (if it is using group management). This also handles periodic offset commits
      * if they are enabled.
@@ -502,20 +503,27 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
     public boolean poll(Timer timer, boolean waitForJoinGroup) {
         maybeUpdateSubscriptionMetadata();
 
+        // note: 执行已完成的 offset(消费进度) 提交请求的回调函数
         invokeCompletedOffsetCommitCallbacks();
 
+        // note: 队列负载算法为自动分配（即 Kafka 根据消费者个数与分区书动态负载分区）的相关的处理逻辑
         if (subscriptions.hasAutoAssignedPartitions()) {
             if (protocol == null) {
                 throw new IllegalStateException("User configured " + ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG +
                     " to empty while trying to subscribe for group protocol to auto assign partitions");
             }
+            // note: 更新发送心跳相关的时间，例如heartbeatTimer、sessionTimer、pollTimer 分别代表发送最新发送心跳的时间、会话最新活跃时间、最新拉取消息
             // Always update the heartbeat last poll time so that the heartbeat thread does not leave the
             // group proactively due to application inactivity even if (say) the coordinator cannot be found.
             pollHeartbeat(timer.currentTimeMs());
+            // note: 如果不存在协调器或协调器已断开连接，则返回 false，结束本次拉取;如果协调器就绪，则继续往下走。
             if (coordinatorUnknownAndUnready(timer)) {
                 return false;
             }
 
+            // note:
+            //  if -> 判断是否需要触发重平衡，即消费组内的所有消费者重新分配topic中的分区信息，例如元数据发送变化
+            //  else -> 用户手动为消费组指定负载的队列的相关处理逻辑
             if (rejoinNeededOrPending()) {
                 // due to a race condition between the initial metadata fetch and the initial rebalance,
                 // we need to ensure that the metadata is fresh before joining initially. This ensures
@@ -549,6 +557,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                 }
             }
         } else {
+            // note: 如果需要更新元数据，并且还没有分区准备好，则同步阻塞等待元数据更新完毕
             // For manually assigned partitions, we do not try to pro-actively lookup coordinator;
             // instead we only try to refresh metadata when necessary.
             // If connections to all nodes fail, wakeups triggered while attempting to send fetch
@@ -563,6 +572,8 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
             client.pollNoWakeup();
         }
 
+        // note: 如果开启了自动提交消费进度，并且已到下一次提交时间，则提交。Kafka 消费者可以通过设置属性 enable.auto.commit 来开启
+        // 自动提交，该参数默认为 true，则默认会每隔 5s 提交一次消费进度，提交间隔可以通过参数 auto.commit.interval.ms 设置。
         maybeAutoCommitOffsetsAsync(timer.currentTimeMs());
         return true;
     }

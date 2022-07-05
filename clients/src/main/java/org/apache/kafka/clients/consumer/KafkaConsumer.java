@@ -1222,19 +1222,25 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
 
     /**
      * @throws KafkaException if the rebalance callback throws exception
+     * @param includeMetadataInTimeout 拉取消息的超时时间是否包含更新元数据的时间，默认为true，即包含
      */
     private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetadataInTimeout) {
+        // note: KafkaConsumer 是否有其他线程再执行，如果有，则抛出异常，因为 KafkaConsumer 是线程不安全的，同一时间只能一个线程执行。
         acquireAndEnsureOpen();
         try {
             this.kafkaConsumerMetrics.recordPollStart(timer.currentTimeMs());
 
+            // note: 如果当前消费者未订阅任何主题或者没有指定队列，则抛出错误，结束本次消息拉取
             if (this.subscriptions.hasNoSubscriptionOrUserAssignment()) {
                 throw new IllegalStateException("Consumer is not subscribed to any topics or assigned any partitions");
             }
 
+            // note: 使用 do while 结构循环拉取消息，直到超时或拉取到消息
             do {
+                // note: 避免在禁止禁用wakeup时，有请求想唤醒时则抛出异常
                 client.maybeTriggerWakeup();
 
+                // note: 更新相关元数据，为真正向 broker 发送消息拉取请求做好准备
                 if (includeMetadataInTimeout) {
                     // try to update assignment metadata BUT do not need to block on the timer for join group
                     updateAssignmentMetadataIfNeeded(timer, false);
@@ -1244,7 +1250,10 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                     }
                 }
 
+                // note: 调用 pollForFetches 向broker拉取消息
                 final Fetch<K, V> fetch = pollForFetches(timer);
+                // note: 如果拉取到的消息集合不为空，再返回该批消息之前，如果还有挤压的拉取请求，可以继续发送拉取请求，但此时会禁用wakeup，
+                // 主要的目的是用户在处理消息时，KafkaConsumer 还可以继续向 broker 拉取消息
                 if (!fetch.isEmpty()) {
                     // before returning the fetched records, we can send off the next round of fetches
                     // and avoid block waiting for their responses to enable pipelining while the user
@@ -1261,6 +1270,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                                 + "since the consumer's position has advanced for at least one topic partition");
                     }
 
+                    // note: 执行消费拦截器
                     return this.interceptors.onConsume(new ConsumerRecords<>(fetch.records()));
                 }
             } while (timer.notExpired());
@@ -1277,6 +1287,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
             return false;
         }
 
+        // note: 更新拉取位移
         return updateFetchPositions(timer);
     }
 
@@ -1284,21 +1295,33 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * @throws KafkaException if the rebalance callback throws exception
      */
     private Fetch<K, V> pollForFetches(Timer timer) {
+        /*
+         * note: 计算本次拉取的超时时间
+         * 1.如果协调器为空，则返回当前定时器剩余时间即可。
+         * 2.如果协调器不为空，其逻辑较为复杂，为下面返回的超时间与当前定时器剩余时间相比取最小值。
+         * 3.如果不开启自动提交位移并且未加入消费组，则超时时间为Long.MAX_VALUE。
+         * 4.如果不开启自动提交位移并且已加入消费组，则返回距离下一次发送心跳包还剩多少时间。
+         * 5.如果开启自动提交位移，则返回 距离下一次自动提交位移所需时间 与 距离下一次发送心跳包所需时间 之间的最小值。
+         */
         long pollTimeout = coordinator == null ? timer.remainingMs() :
                 Math.min(coordinator.timeToNextPoll(timer.currentTimeMs()), timer.remainingMs());
 
+        // note: 如果数据已经拉回到本地，直接返回数据
         // if data is available already, return it immediately
         final Fetch<K, V> fetch = fetcher.collectFetch();
         if (!fetch.isEmpty()) {
             return fetch;
         }
 
+        // note: 组装发送请求，并将其存储在待发送请求列表中
         // send any new fetches (won't resend pending fetches)
         fetcher.sendFetches();
 
         // We do not want to be stuck blocking in poll if we are missing some positions
         // since the offset lookup may be backing off after a failure
 
+        // note: 如果已缓存的分区信息中存在某些分区缺少偏移量，如果拉取的超时时间大于失败重试需要阻塞的时间，则更新此次拉取的超时时间
+        // 为失败重试需要的间隔时间，主要的目的是不希望在 poll 过程中被阻塞
         // NOTE: the use of cachedSubscriptionHasAllFetchPositions means we MUST call
         // updateAssignmentMetadataIfNeeded before this method.
         if (!cachedSubscriptionHasAllFetchPositions && pollTimeout > retryBackoffMs) {
@@ -1307,14 +1330,17 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
 
         log.trace("Polling for fetches with timeout {}", pollTimeout);
 
+        // note: 通过调用NetworkClient 的 poll 方法发起消息拉取操作（触发网络读写）
         Timer pollTimer = time.timer(pollTimeout);
         client.poll(pollTimer, () -> {
             // since a fetch might be completed by the background thread, we need this poll condition
             // to ensure that we do not block unnecessarily in poll()
             return !fetcher.hasAvailableFetches();
         });
+        // note: 更新本次拉取的时间
         timer.update(pollTimer.currentTimeMs());
 
+        // note: 将从 broker 读取到的数据返回（即封装成消息）
         return fetcher.collectFetch();
     }
 
@@ -2449,9 +2475,11 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
         // If any partitions have been truncated due to a leader change, we need to validate the offsets
         fetcher.validateOffsetsIfNeeded();
 
+        // note: 如果订阅关系中的所有分区都有有效的位移，则返回 true
         cachedSubscriptionHasAllFetchPositions = subscriptions.hasAllFetchPositions();
         if (cachedSubscriptionHasAllFetchPositions) return true;
 
+        // note: @2如果存在任意一个分区没有有效的位移信息，则需要向 broker 发送请求，从broker 获取该消费组，该分区的消费进度
         // If there are any partitions which do not have a valid position and are not
         // awaiting reset, then we need to fetch committed offsets. We will only do a
         // coordinator lookup if there are partitions which have missing positions, so
@@ -2459,11 +2487,13 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
         // by always ensuring that assigned partitions have an initial position.
         if (coordinator != null && !coordinator.refreshCommittedOffsetsIfNeeded(timer)) return false;
 
+        // note: 如果经过第二步，订阅关系中还某些分区还是没有获取到有效的偏移量，则使用偏移量重置策略进行重置，如果未配置，则抛出异常
         // If there are partitions still needing a position and a reset policy is defined,
         // request reset using the default policy. If no reset strategy is defined and there
         // are partitions with a missing position, then we will raise an exception.
         subscriptions.resetInitializingPositions();
 
+        // note: 发送一个异步请求去重置那些正等待重置位置的分区
         // Finally send an asynchronous request to lookup and update the positions of any
         // partitions which are awaiting reset.
         fetcher.resetOffsetsIfNeeded();

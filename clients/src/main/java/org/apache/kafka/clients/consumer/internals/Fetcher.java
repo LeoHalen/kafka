@@ -49,8 +49,8 @@ import org.apache.kafka.common.errors.TimeoutException;
 import org.apache.kafka.common.errors.TopicAuthorizationException;
 import org.apache.kafka.common.header.Headers;
 import org.apache.kafka.common.header.internals.RecordHeaders;
-import org.apache.kafka.common.message.FetchResponseData;
 import org.apache.kafka.common.message.ApiVersionsResponseData.ApiVersion;
+import org.apache.kafka.common.message.FetchResponseData;
 import org.apache.kafka.common.message.ListOffsetsRequestData.ListOffsetsPartition;
 import org.apache.kafka.common.message.ListOffsetsResponseData.ListOffsetsPartitionResponse;
 import org.apache.kafka.common.message.ListOffsetsResponseData.ListOffsetsTopicResponse;
@@ -65,7 +65,6 @@ import org.apache.kafka.common.metrics.stats.Value;
 import org.apache.kafka.common.metrics.stats.WindowedCount;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
-import org.apache.kafka.common.utils.BufferSupplier;
 import org.apache.kafka.common.record.ControlRecordType;
 import org.apache.kafka.common.record.Record;
 import org.apache.kafka.common.record.RecordBatch;
@@ -78,6 +77,7 @@ import org.apache.kafka.common.requests.MetadataRequest;
 import org.apache.kafka.common.requests.MetadataResponse;
 import org.apache.kafka.common.requests.OffsetsForLeaderEpochRequest;
 import org.apache.kafka.common.serialization.Deserializer;
+import org.apache.kafka.common.utils.BufferSupplier;
 import org.apache.kafka.common.utils.CloseableIterator;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
@@ -643,18 +643,34 @@ public class Fetcher<K, V> implements Closeable {
      * @throws TopicAuthorizationException If there is TopicAuthorization error in fetchResponse.
      */
     public Fetch<K, V> collectFetch() {
+        // note: 按分区存放已拉取的消息（按消费的主题分区和数据map映射关系做了封装），返回给客户端进行处理
         Fetch<K, V> fetch = Fetch.empty();
         Queue<CompletedFetch> pausedCompletedFetches = new ArrayDeque<>();
+        // note: 维护一个剩下的记录数，便于控制消费最大的记录数
         int recordsRemaining = maxPollRecords;
 
         try {
+            /*
+             * note: 循环去取已经完成了 Fetch 请求的消息(只要剩下的记录数大于0，就继续消费)，该 while 循环有两个跳出条件：
+             * 1.如果拉取的消息已经达到一次拉取的最大消息条数，则跳出循环。
+             * 2.缓存中所有拉取结果已处理。
+             */
             while (recordsRemaining > 0) {
+                /*
+                 * note: 此处的if/else主要完成从缓存中解析数据的两个步骤，初次运行的时候，会进入分支if，然后会调用 initializeCompletedFetch
+                 * 解析成 PartitionRecords 对象，然后代码@4的职责就是从解析 PartitionRecords ，将消息封装成 ConsumerRecord，返回给消费
+                 * 端线程处理。
+                 */
+                // note: 判断分区记录是否为空 或者 它是否被获取(消费)过
                 if (nextInLineFetch == null || nextInLineFetch.isConsumed) {
+                    // note: 获取但不删除队列的头元素
                     CompletedFetch records = completedFetches.peek();
                     if (records == null) break;
 
+                    // note: 判断是否初始化过，没有则执行初始化逻辑
                     if (records.notInitialized()) {
                         try {
+                            // note: 初始化逻辑
                             nextInLineFetch = initializeCompletedFetch(records);
                         } catch (Exception e) {
                             // Remove a completedFetch upon a parse with exception if (1) it contains no records, and
@@ -679,6 +695,7 @@ public class Fetcher<K, V> implements Closeable {
                     pausedCompletedFetches.add(nextInLineFetch);
                     nextInLineFetch = null;
                 } else {
+                    // note: 出现这种情况的原因是？？？
                     Fetch<K, V> nextFetch = fetchRecords(nextInLineFetch, recordsRemaining);
                     recordsRemaining -= nextFetch.numRecords();
                     fetch.add(nextFetch);
