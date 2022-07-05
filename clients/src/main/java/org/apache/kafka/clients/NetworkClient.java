@@ -574,6 +574,7 @@ public class NetworkClient implements KafkaClient {
         handleTimedOutRequests(responses, updatedNow);
         completeResponses(responses);
 
+        log.debug("TEST | client轮询完成");
         return responses;
     }
 

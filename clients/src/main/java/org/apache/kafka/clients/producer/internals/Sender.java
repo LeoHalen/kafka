@@ -240,6 +240,7 @@ public class Sender implements Runnable {
         // main loop, runs until close is called
         while (running) {
             try {
+                log.debug("TEST | 循环");
                 runOnce();
             } catch (Exception e) {
                 log.error("Uncaught error in kafka producer I/O thread: ", e);
@@ -323,9 +324,12 @@ public class Sender implements Runnable {
             }
         }
 
+        log.debug("TEST | 发送");
         long currentTimeMs = time.milliseconds();
         long pollTimeout = sendProducerData(currentTimeMs);
+        log.debug("TEST | 寻轮超时时间=> {}", pollTimeout);
         client.poll(pollTimeout, currentTimeMs);
+        log.debug("TEST | 轮询完成");
     }
 
     private long sendProducerData(long now) {
